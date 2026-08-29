@@ -2,7 +2,15 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Looper</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#141414">
+<script>
+if ('serviceWorker' in navigator) {
+  addEventListener('load', function(){ navigator.serviceWorker.register('sw.js').catch(function(){}); });
+}
+</script>
 <style>
   body { background:#141414; color:#ddd; font:13px/1.5 ui-monospace,Consolas,monospace; margin:16px; }
   #top { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
@@ -14,12 +22,11 @@
   .slot { position:absolute; inset:0; }
   .slot iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
   #bar { position:relative; width:480px; height:34px; margin-top:12px; background:#1e1e1e;
-         border:1px solid #444; touch-action:none; user-select:none; }
-  #region { position:absolute; top:0; bottom:0; background:#2a4a3a; }
-  .handle { position:absolute; top:0; bottom:0; width:9px; margin-left:-4px; background:#4c8;
-            cursor:ew-resize; }
-  #head { position:absolute; top:0; bottom:0; width:3px; margin-left:-1px; background:#fff; cursor:ew-resize; }
-  #ghost { position:absolute; top:0; bottom:0; width:3px; margin-left:-1px; background:#ff0; display:none; }
+         border:1px solid #444; touch-action:none; user-select:none; cursor:pointer; }
+  #region { position:absolute; top:0; bottom:0; background:#2a4a3a; border-left:1px solid #4c8;
+            border-right:1px solid #4c8; pointer-events:none; }
+  #head { position:absolute; top:0; bottom:0; width:3px; margin-left:-1px; background:#fff;
+          pointer-events:none; }
   #time { margin-top:6px; color:#888; }
 </style>
 </head>
@@ -28,7 +35,7 @@
 <div id="top">
   <input type="text" id="url" value="https://www.youtube.com/watch?v=Z_mzYS-ET8o" placeholder="YouTube URL">
   <input type="number" id="ls" value="18.1" step="0.001">
-  <input type="number" id="le" value="25.7" step="0.001">
+  <input type="number" id="bpm" value="120" step="0.01" min="1" title="BPM">
   <button id="back">&laquo;</button>
   <button id="fwd">&raquo;</button>
   <select id="rate"><option>0.5</option><option>0.75</option><option selected>1</option></select>
@@ -41,10 +48,7 @@
 
 <div id="bar">
   <div id="region"></div>
-  <div class="handle" id="hStart"></div>
-  <div class="handle" id="hEnd"></div>
   <div id="head"></div>
-  <div id="ghost"></div>
 </div>
 <div id="time"></div>
 
@@ -54,7 +58,13 @@ var XF=250, POLL=20, STEPS=10, MAXCORR=1.25, JUMP_SETTLE=250, ARM_MIN=1.5;
 var $=function(s){ return document.getElementById(s); };
 var P={A:null,B:null}, live='A', armed='B';
 var phase='idle';                       // idle | starting | running | fading
-var cfg={id:'',ls:18.1,le:25.7,rate:1};
+var cfg={id:'',ls:18.1,bpm:120,le:0,rate:1};
+
+// The loop is always 4 bars of 4/4 = 16 beats, so tempo fixes its length and only the start
+// is free. cfg.le stays a real field: every calculation downstream is written against it.
+function loopDur(){ return 16*60/cfg.bpm; }
+function setEnd(){ cfg.le=cfg.ls+loopDur(); }
+setEnd();
 var T={A:trk(),B:trk()};
 var poller=null, cur={}, jumpReq=null, vidDur=0, apiReady=false, loadT=null, paused=false, nudge=0;
 
@@ -79,27 +89,31 @@ function parseId(s){
 }
 
 // ---------- URL parameters ----------
-// ?v=<id|url>&ls=<sec>&le=<sec> seeds the fields; every later change writes back, so the
+// ?v=<id|url>&ls=<sec>&bpm=<bpm> seeds the fields; every later change writes back, so the
 // address bar is always a shareable link to the current loop.
+// text/title/url are what the Android share sheet delivers (manifest share_target); the
+// YouTube app usually drops the link into `text` alongside other words, so parseId digs
+// the id out of whatever string arrives.
 function readParams(){
   var q=new URLSearchParams(location.search);
-  var id=parseId(q.get('v')||q.get('url')||'');
+  var id=parseId(q.get('v')||q.get('url')||q.get('text')||q.get('title')||'');
   if(id) $('url').value='https://www.youtube.com/watch?v='+id;
-  var a=parseFloat(q.get('ls')), b=parseFloat(q.get('le'));
-  if(!isNaN(a)&&!isNaN(b)&&a>=0&&b>a){ cfg.ls=a; cfg.le=b; }
-  else if(!isNaN(a)&&a>=0&&a<cfg.le) cfg.ls=a;
-  else if(!isNaN(b)&&b>cfg.ls) cfg.le=b;
+  var a=parseFloat(q.get('ls')), t=parseFloat(q.get('bpm'));
+  if(!isNaN(t)&&t>0) cfg.bpm=t;
+  if(!isNaN(a)&&a>=0) cfg.ls=a;
+  setEnd();
   $('ls').value=+cfg.ls.toFixed(3);
-  $('le').value=+cfg.le.toFixed(3);
+  $('bpm').value=+cfg.bpm.toFixed(2);
 }
 
 function pushParams(){
   var q=new URLSearchParams(location.search);
   var id=parseId($('url').value);
-  q.delete('url');
+  q.delete('url'); q.delete('text'); q.delete('title');   // share-sheet params, folded into v
   if(id) q.set('v',id); else q.delete('v');
   q.set('ls',+cfg.ls.toFixed(3));
-  q.set('le',+cfg.le.toFixed(3));
+  q.set('bpm',+cfg.bpm.toFixed(2));
+  q.delete('le');                                          // superseded by bpm
   // file:// forbids replaceState in some browsers; the page must not die over a URL
   try{ history.replaceState(null,'','?'+q.toString()+location.hash); }catch(e){}
 }
@@ -332,7 +346,8 @@ function done(from,to){
   T[armed].ready=false;
   cur={rearmed:false};
   phase='running';
-  if(jumpReq && jumpReq.deferred){ var w=jumpReq.want; jumpReq=null; armJump(w); }
+  if(jumpReq && jumpReq.deferred){ var j=jumpReq; jumpReq=null;
+    armJump(j.abs!==undefined ? j.abs-proj(live) : j.want); }
 }
 
 // ---------- jumping: window and playhead move together, by whole loops ----------
@@ -365,7 +380,8 @@ function jumpBy(n){
 // and fade as soon as the armed player is genuinely playing. No lead, no position trigger.
 function armJump(want){
   if(phase==='fading'){
-    jumpReq={deferred:true,want:(jumpReq?jumpReq.want:0)+want};
+    if(jumpReq && jumpReq.abs!==undefined) jumpReq.abs+=want;   // still absolute, just moved
+    else jumpReq={deferred:true,want:(jumpReq?jumpReq.want:0)+want};
     return;
   }
   var w=(jumpReq && !jumpReq.deferred ? jumpReq.want : 0)+want;   // repeat presses accumulate
@@ -375,6 +391,26 @@ function armJump(want){
   jumpReq={want:w};
   cur.rearmed=true;
   seek(armed,tgt);
+}
+
+// Absolute seek. The window slides by whole loops until it encloses the new position, so
+// the loop keeps its alignment with the material; the playhead lands exactly where asked.
+function jumpTo(t){
+  if(phase!=='running' && phase!=='fading') return;
+  var dur=cfg.le-cfg.ls;
+  var n=Math.floor((t-cfg.ls)/dur);
+  var nls=cfg.ls+n*dur, nle=cfg.le+n*dur;
+  if(nls<0 || (vidDur && nle>vidDur)) return;
+  cfg.ls=nls; cfg.le=nle; syncInputs();
+  if(paused){
+    try{ P[live].seekTo(t,true); }catch(e){}
+    cur.rearmed=false;
+    return;
+  }
+  // Mid-fade the live player is about to change under us, so hand the target over as an
+  // absolute time and let done() turn it into an offset once the new live player is known.
+  if(phase==='fading'){ jumpReq={deferred:true,abs:t}; return; }
+  armJump(t-proj(live)-(jumpReq?jumpReq.want:0));   // armJump adds the pending want back
 }
 
 $('fwd').onclick=function(){ jumpBy(1); };
@@ -402,18 +438,18 @@ document.addEventListener('keydown',function(e){
 });
 
 // ---------- bounds + rate ----------
-function syncInputs(){ $('ls').value=+cfg.ls.toFixed(3); $('le').value=+cfg.le.toFixed(3); pushParams(); }
+function syncInputs(){ $('ls').value=+cfg.ls.toFixed(3); $('bpm').value=+cfg.bpm.toFixed(2); pushParams(); }
 function boundsChanged(){ cur.rearmed=false; pushParams(); }
 
 $('ls').onchange=function(){
   var v=parseFloat(this.value);
-  if(isNaN(v)||v<0||v>=cfg.le) return syncInputs();
-  cfg.ls=v; boundsChanged();
+  if(isNaN(v)||v<0) return syncInputs();
+  cfg.ls=v; setEnd(); boundsChanged();
 };
-$('le').onchange=function(){
+$('bpm').onchange=function(){
   var v=parseFloat(this.value);
-  if(isNaN(v)||v<=cfg.ls) return syncInputs();
-  cfg.le=v; boundsChanged();
+  if(isNaN(v)||v<=0) return syncInputs();
+  cfg.bpm=v; setEnd(); boundsChanged();
 };
 $('rate').onchange=function(){
   cfg.rate=parseFloat(this.value);
@@ -421,7 +457,7 @@ $('rate').onchange=function(){
 };
 
 // ---------- seek bar ----------
-var bar=$('bar'), drag=null;
+var bar=$('bar');
 
 function xToTime(e){
   var r=bar.getBoundingClientRect();
@@ -431,34 +467,8 @@ function xToTime(e){
 
 bar.addEventListener('pointerdown',function(e){
   if(!vidDur) return;
-  var id=e.target.id;
-  if(id!=='hStart'&&id!=='hEnd'&&id!=='head') return;
-  drag={id:id, step:cfg.le-cfg.ls, t0:xToTime(e), n:0,
-        base: id==='hStart'?cfg.ls : id==='hEnd'?cfg.le : proj(live)};
-  bar.setPointerCapture(e.pointerId);
   e.preventDefault();
-});
-
-bar.addEventListener('pointermove',function(e){
-  if(!drag) return;
-  drag.n=Math.round((xToTime(e)-drag.t0)/drag.step);   // snap to whole loop durations
-  var g=$('ghost');
-  g.style.display='block';
-  g.style.left=(100*(drag.base+drag.n*drag.step)/vidDur)+'%';
-});
-
-bar.addEventListener('pointerup',function(e){
-  if(!drag) return;
-  var d=drag; drag=null;
-  $('ghost').style.display='none';
-  if(!d.n) return;
-  var v=d.base+d.n*d.step;
-  if(d.id==='head'){ jumpBy(d.n); }
-  else if(d.id==='hStart'){
-    if(v>=0 && v<=cfg.le-d.step){ cfg.ls=v; syncInputs(); boundsChanged(); }
-  } else {
-    if(v>=cfg.ls+d.step && (!vidDur||v<=vidDur)){ cfg.le=v; syncInputs(); boundsChanged(); }
-  }
+  jumpTo(xToTime(e));
 });
 
 // ---------- render ----------
@@ -472,8 +482,6 @@ function render(){
     var a=100*cfg.ls/vidDur, b=100*cfg.le/vidDur;
     $('region').style.left=a+'%';
     $('region').style.width=(b-a)+'%';
-    $('hStart').style.left=a+'%';
-    $('hEnd').style.left=b+'%';
     $('head').style.left=(100*L/vidDur)+'%';
     $('time').textContent=fmt(L)+'   loop '+fmt(cfg.ls)+' - '+fmt(cfg.le)+'   ('+(cfg.le-cfg.ls).toFixed(2)+'s)'+(paused?'   PAUSED':'');
   }
