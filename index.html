@@ -1,0 +1,795 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>YT dual-player crossfade loop diagnostic</title>
+<style>
+  body { background:#111; color:#ddd; font:12px/1.45 ui-monospace,Consolas,monospace; margin:12px; }
+  h1 { font-size:14px; margin:0 0 8px; color:#8cf; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; }
+  .pane { border:1px solid #333; padding:8px; }
+  .pane.live { border-color:#3c6; }
+  input,select,button { background:#1c1c1c; color:#ddd; border:1px solid #444; font:inherit; padding:3px 5px; }
+  input[type=text],input[type=number] { width:110px; }
+  #vid { width:320px; }
+  button { cursor:pointer; padding:4px 12px; }
+  button:disabled { opacity:.4; cursor:default; }
+  table { border-collapse:collapse; }
+  td,th { padding:1px 8px 1px 0; text-align:right; white-space:nowrap; }
+  th { color:#888; font-weight:normal; }
+  td.l,th.l { text-align:left; }
+  #controls > * { margin-right:6px; display:inline-block; }
+  .box { border:1px solid #333; padding:8px; min-width:300px; }
+  .k { color:#888; }
+  .warn { color:#f66; font-weight:bold; }
+  .ok { color:#6c6; }
+  .amber { color:#fc6; }
+  #banner { background:#400; border:1px solid #f66; color:#f99; padding:6px; margin:8px 0; display:none; white-space:pre-wrap; }
+  #log { height:180px; overflow:auto; background:#0a0a0a; border:1px solid #333; padding:6px; white-space:pre; }
+  #passes { height:180px; overflow:auto; }
+  .role { font-weight:bold; margin-bottom:4px; }
+  .notes { color:#777; max-width:980px; margin-top:14px; }
+  .notes b { color:#999; }
+  code { color:#9bd; }
+</style>
+</head>
+<body>
+<h1>YouTube dual-IFrame crossfade loop &mdash; diagnostic</h1>
+
+<div id="controls">
+  <label>video id/url <input type="text" id="vid" value="https://www.youtube.com/watch?v=Z_mzYS-ET8o" placeholder="dQw4w9WgXcQ or full URL"></label>
+  <label>loopStart <input type="number" id="ls" value="18.1" step="0.001"></label>
+  <label>loopEnd <input type="number" id="le" value="25.7" step="0.001"></label>
+  <button id="bPrev" title="shift window back one length">&laquo; loop</button>
+  <button id="bNext" title="shift window forward one length">loop &raquo;</button>
+  <label>xfade ms <input type="number" id="xf" value="250" step="1"></label>
+  <label>rate <button id="bRateDn" title="slower">&minus;</button><select id="rate">
+    <option>0.25</option><option>0.5</option><option>0.75</option>
+    <option selected>1</option><option>1.25</option><option>1.5</option>
+    <option>1.75</option><option>2</option></select><button id="bRateUp" title="faster">+</button></label>
+  <label>curve <select id="curve"><option value="eq">equal-power</option><option value="lin">linear</option></select></label>
+  <label>park delay ms <input type="number" id="pd" value="400" step="10"></label>
+  <button id="bLoad">Load</button>
+  <button id="bStart" disabled>Start Loop</button>
+  <button id="bStop" disabled>Stop</button>
+  <label><input type="checkbox" id="lowq"> armed &rarr; setPlaybackQuality('small')</label>
+</div>
+
+<div id="banner"></div>
+
+<div class="row" style="margin-top:10px">
+  <div class="pane" id="paneA"><div class="role" id="roleA">A</div><div id="playerA"></div></div>
+  <div class="pane" id="paneB"><div class="role" id="roleB">B</div><div id="playerB"></div></div>
+  <div class="box">
+    <div><b>players</b></div>
+    <table id="tState"></table>
+    <div style="margin-top:8px"><b>current pass</b></div>
+    <table id="tPass"></table>
+    <div style="margin-top:8px"><b>armedErr stats (last 20)</b></div>
+    <table id="tStats"></table>
+  </div>
+</div>
+
+<div class="row" style="margin-top:10px">
+  <div class="box" style="min-width:560px">
+    <div><b>last 20 passes</b></div>
+    <div class="k" style="margin-bottom:4px">armedErr = armed playhead minus its ideal (loopStart-xfade) at fade start. That is the residual left after the sync correction.</div>
+    <div id="passes"></div>
+  </div>
+  <div class="box" style="flex:1;min-width:420px">
+    <div><b>event log</b></div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<div class="notes">
+<b>What this measures.</b> A and B both play continuously and are never paused. One is audible (live), one is silent (armed) and parked ~1.5&nbsp;s before loopStart.
+At <code>loopEnd - xfade + correction</code> the two volumes are ramped past each other in 10 <code>setVolume</code> steps, then the roles swap.
+<code>correction = (liveTime - armedTime) - loopDuration</code>, recomputed on every 20&nbsp;ms poll from sub-poll-interpolated playheads &mdash; i.e. the fade trigger is slaved to where the armed player <i>actually</i> is, not to where its seek was told to land. <b>armedErr</b> is what survives that correction; watch whether it converges or wanders.
+<br><br>
+<b>Seeks land late, not just wrong.</b> A seeking player's playhead <i>freezes</i> until the seek resolves while the live player keeps moving, so aiming the armed player at <code>live - loopDuration</code> using live's position at issue time lands it short by exactly the settle time. The re-arm therefore aims at where live <i>will</i> be on landing, using the last measured settle, and the arm lead stretches to <code>settle + 0.8 s</code> when that exceeds 1.5&nbsp;s. Without this a client with ~900&nbsp;ms seek settle never locks on at all: every pass exceeds the correction clamp, holds, and misses.
+<br><br>
+<b>Deliberate deviation from spec:</b> the retired player is parked at <code>loopStart-1.5</code> immediately after the swap <i>and</i> re-seeked ahead of the fade whenever the loop is longer than ~2&nbsp;s. Without that second seek the armed player just runs on past loopStart for the whole pass and there is nothing to fade into. Both seeks are logged; the re-arm is the one whose landing error matters.
+<br><br>
+<b>Failure modes watched:</b> a player that never reaches state 1 raises the red banner (concurrent hardware-decoder cap, typical of Android WebViews). Ad playback is inferred from <code>getDuration()</code> departing from the baseline, plus any unexpected state transition, both logged. Autoplay policy is handled by muting both players, starting them from the single Start gesture, then unmuting once both report state 1.
+<b>Caveat:</b> <code>setPlaybackQuality</code> is deprecated and a no-op on many clients &mdash; if the checkbox changes nothing, that is why, and the decoder cap is not dodgeable through this API.
+<br><br>
+<b>Why the crossfade cannot be short.</b> The ramp is 10 <code>setVolume</code> calls, but each one is a <code>postMessage</code> across the iframe origin boundary that the player applies on its own event-loop turn, unacknowledged and untimestamped, and the <code>setTimeout</code> driving them is clamped and jittery in the low single-digit ms. At 60&nbsp;ms that is 6&nbsp;ms per step and the ramp is noise, so steps are floored at <b>20 ms</b> each: <code>steps = min(10, floor(xfade/20))</code>, and 10 real steps needs xfade &ge; 200&nbsp;ms. Default is now 250&nbsp;ms. The <b>step nom</b> / <b>step max</b> columns are the scheduled vs. worst actual interval per pass &mdash; if step max runs well over nominal, the fade shape you heard is not the one in the code.
+<br><br>
+<b>The floor under all of this:</b> <code>setVolume</code> sets a scalar, it does not schedule a ramp. However long the crossfade, what you get is a staircase of discrete gain jumps, not a curve. That is the real difference from a Web Audio crossfade, and the likeliest source of an audible zipper artifact at the splice. Try equal-power vs. linear and longer durations to see how far it can be pushed down.
+<br><br>
+<b>Chasing an audible pause at the switch.</b> Three different things sound like "a brief pause"; the <b>gap</b> column separates them. It is the maximum time the newly-live player's <code>currentTime</code> stopped moving across the splice, next to that player's own rolling <b>base</b>line staleness.
+<ul>
+<li><b>gap is near baseline</b> &rarr; no decoder stall. What you heard is the fade curve. Two copies of the same audio a few ms apart are only partly coherent, so a <i>linear</i> ramp sums to roughly a 3&nbsp;dB notch at the midpoint, plus comb filtering from the offset. At 60&nbsp;ms that reads as a click; at 250&nbsp;ms it reads as a dip, i.e. a pause. Switch <b>curve</b> to equal-power (now the default) and shorten the fade to test.</li>
+<li><b>gap spikes, or shows BUF</b> &rarr; a real dropout. Either the armed player was promoted while still buffering (the fade now refuses to start unless it is in state 1 and moving, and says so), or the park <code>seekTo</code> on the retiring player stalled its sibling's decoder.</li>
+<li><b>park delay</b> tests that last one directly. The retired player is parked this many ms after the switch instead of during it. Set it to 0 for the original behaviour; if the gap returns at 0 and disappears at 400, seek contention is your culprit.</li>
+</ul>
+<b>Loop window jumping.</b> <code>loop &raquo;</code> and <code>&laquo; loop</code> move the window <i>and the playhead</i> by one loop duration together: the window goes to <code>[end, end+dur]</code> or <code>[start-dur, start]</code>, and playback moves <code>+/- dur</code> to match. Your position <i>within</i> the loop is preserved, so two bars into an eight-bar loop you land two bars into the next section rather than being thrown back to its start.
+<br><br>
+Both players advance at the same rate, so <code>armed - live</code> is frozen the instant the seek lands and never changes afterwards. No lead and no positional trigger are needed: the <code>+/- dur</code> offset is baked into the seek target and the fade runs as soon as the armed player is genuinely playing. The target aims at where live <i>will</i> be on landing, using the last measured settle, so latency is roughly settle + 250&nbsp;ms &mdash; about 400&nbsp;ms on a fast client, stretching on a slow one. Because the offset is fixed at seek time rather than triggered by position, settle misprediction shows up directly as jump error; it is logged per jump (<code>offset X s vs wanted Y s</code>) and scored in the <b>armedErr</b> column for jump rows.
+<br><br>
+Pressing again before a jump has fired <b>accumulates</b> rather than replacing, so a double press moves both the bounds and the playhead by two durations. A jump pressed during a crossfade is queued and fires when that fade completes, and a pending jump suppresses the deferred park seek that would otherwise clobber its target. Note that your offset into the loop advances by the jump latency, because the audio never stops &mdash; that is elapsed time, not error.
+<br><br>
+<b>Playback rate</b> applies live to both players via the dropdown or the &minus;/+ steppers, not just at Start. YouTube silently ignores any rate outside <code>getAvailablePlaybackRates()</code> (logged per player at onReady), so each change is verified against what the players actually report and a mismatch is logged rather than assumed away. The playhead interpolator uses each player's <i>own</i> reported rate, and a rate mismatch between the two is called out explicitly &mdash; it makes them drift apart in media time, which shows up as a correction that never settles.
+</div>
+
+<script>
+var tag=document.createElement('script');
+tag.src="https://www.youtube.com/iframe_api";
+document.head.appendChild(tag);
+
+function $(id){ return document.getElementById(id); }
+var P={A:null,B:null};
+var apiReady=false;
+var live='A', armed='B';
+var phase='idle';                 // idle | loading | ready | starting | running | fading | stopped
+var cfg={id:'',ls:0,le:0,xf:60,rate:1,curve:'lin'};
+var ARM_LEAD=1.5, MAXCORR=0.75, POLL=20;
+var MIN_STEP=20;                  // ms floor per volume step; see startFade()
+var warnedSteps=false;
+var rateMismatchLogged=false;
+var jumpReq=null;                 // pending window jump, survives a cur swap mid-fade
+var JUMP_SETTLE=250;              // ms a jump-armed player must be settled before splicing
+var pollTimer=null;
+var passNo=0, passes=[], cur={};
+var startWall=0, qcount=0;
+
+function mkTrk(){ return {raw:-1,rawWall:0,state:-99,everPlaying:false,baseDur:0,adFlag:false,ready:false,seek:null,stall:0,staleMax:0,staleBase:0,qualitySet:false,readyWall:0,rate:1,lastSettle:0}; }
+var watch=null;   // post-switch audio-continuity monitor
+var T={A:mkTrk(),B:mkTrk()};
+
+function now(){ return performance.now(); }
+
+function log(s,cls){
+  var d=new Date();
+  var t=d.toLocaleTimeString()+'.'+String(d.getMilliseconds());
+  var el=$('log');
+  var line=document.createElement('div');
+  if(cls) line.className=cls;
+  line.textContent=t+'  '+s;
+  el.appendChild(line);
+  while(el.childNodes.length>300) el.removeChild(el.firstChild);
+  el.scrollTop=el.scrollHeight;
+}
+function banner(s){ var b=$('banner'); b.style.display='block'; b.textContent=s; }
+
+function parseId(s){
+  s=(s||'').trim();
+  if(!s) return '';
+  var m=s.match(/[?&]v=([A-Za-z0-9_-]{6,})/); if(m) return m[1];
+  m=s.match(/youtu\.be\/([A-Za-z0-9_-]{6,})/); if(m) return m[1];
+  m=s.match(/\/(?:embed|shorts|live)\/([A-Za-z0-9_-]{6,})/); if(m) return m[1];
+  return s.replace(/[^A-Za-z0-9_-]/g,'');
+}
+
+function stateName(s){
+  var n={'-1':'unstarted','0':'ENDED','1':'playing','2':'PAUSED','3':'buffering','5':'cued'}[String(s)];
+  return n || ('?'+s);
+}
+
+// sub-poll interpolated playhead; extrapolation is capped so a stall cannot run away
+function proj(k){
+  var t=T[k];
+  if(t.raw<0) return 0;
+  var dt=(now()-t.rawWall)/1000*(t.rate||cfg.rate);
+  if(dt>0.5) dt=0.5;
+  return t.raw+dt;
+}
+
+window.onYouTubeIframeAPIReady=function(){ apiReady=true; log('IFrame API ready'); };
+
+// background tabs throttle setInterval to ~1 Hz and pause rAF entirely: every number
+// on this page is garbage while hidden. Keep the tab foreground and in front.
+var hiddenSince=0;
+document.addEventListener('visibilitychange',function(){
+  if(document.hidden){
+    hiddenSince=now();
+    if(phase==='running'||phase==='fading'||phase==='starting')
+      log('TAB HIDDEN: 20 ms poll is now throttled to ~1 Hz and rAF is paused. All timing below is invalid until it is visible again.','warn');
+  } else if(hiddenSince){
+    log('tab visible again after '+((now()-hiddenSince)/1000).toFixed(1)+' s; discard passes spanning that gap','amber');
+    hiddenSince=0;
+  }
+});
+
+$('bLoad').onclick=function(){
+  if(!apiReady){ log('API not ready yet','warn'); return; }
+  cfg.id=parseId($('vid').value);
+  if(!cfg.id){ log('no video id','warn'); return; }
+  $('banner').style.display='none';
+  if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+  phase='loading';
+  T.A=mkTrk(); T.B=mkTrk();
+  passes=[]; passNo=0; cur={};
+  ['A','B'].forEach(function(k){
+    if(P[k]){ try{ P[k].destroy(); }catch(e){} P[k]=null; }
+    $('pane'+k).innerHTML='<div class="role" id="role'+k+'">'+k+'</div><div id="player'+k+'"></div>';
+  });
+  ['A','B'].forEach(mkPlayer);
+  log('creating players for '+cfg.id);
+};
+
+function mkPlayer(k){
+  var vars={controls:1,disablekb:1,modestbranding:1,rel:0,playsinline:1,fs:0};
+  if(location.protocol!=='file:') vars.origin=location.origin;
+  P[k]=new YT.Player('player'+k,{
+    height:'240', width:'400', videoId:cfg.id, playerVars:vars,
+    events:{
+      onReady:function(){
+        var av=''; try{ av=' rates='+P[k].getAvailablePlaybackRates().join('/'); }catch(e){}
+        log('player '+k+' onReady'+av);
+        if(P.A && P.B && P.A.getPlayerState && P.B.getPlayerState){ $('bStart').disabled=false; phase='ready'; }
+      },
+      onStateChange:function(){},   // polled instead; API cadence is not trusted here
+      onError:function(e){
+        log('player '+k+' ERROR code '+e.data,'warn');
+        banner('Player '+k+' error code '+e.data+'  (2 = bad id, 5 = html5 player, 100 = removed, 101/150 = embedding disabled for this video).');
+      },
+      onPlaybackQualityChange:function(e){ log('player '+k+' quality -> '+e.data); }
+    }
+  });
+}
+
+$('bStart').onclick=function(){
+  cfg.ls=parseFloat($('ls').value);
+  cfg.le=parseFloat($('le').value);
+  cfg.xf=parseFloat($('xf').value);
+  cfg.rate=parseFloat($('rate').value);
+  cfg.curve=$('curve').value;
+  cfg.pd=parseFloat($('pd').value)||0;
+  if(!(cfg.le>cfg.ls)){ log('loopEnd must be > loopStart','warn'); return; }
+  if(cfg.le-cfg.ls < cfg.xf/1000+0.3){ log('loop shorter than crossfade+0.3s; results will be nonsense','warn'); }
+  if(cfg.ls < ARM_LEAD+0.2){ log('loopStart < '+(ARM_LEAD+0.2)+'s: no room to park the armed player before it','warn'); }
+  passNo=0; passes=[]; cur={}; rateMismatchLogged=false; warnedSteps=false; jumpReq=null;
+  live='A'; armed='B';
+  phase='starting'; startWall=now();
+  $('bStop').disabled=false; $('bStart').disabled=true;
+  // autoplay policy: both start muted, from this one user gesture
+  ['A','B'].forEach(function(k){
+    try{
+      P[k].mute(); P[k].setVolume(0);
+      P[k].setPlaybackRate(cfg.rate);
+      if(k===armed && $('lowq').checked){ try{ P[k].setPlaybackQuality('small'); }catch(e){} }
+      P[k].playVideo();
+    }catch(e){ log('start '+k+' threw '+e,'warn'); }
+  });
+  log('START: both muted + playVideo() from the user gesture; waiting for state 1 on both');
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer=setInterval(poll,POLL);
+};
+
+$('bStop').onclick=function(){
+  phase='stopped';
+  if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+  ['A','B'].forEach(function(k){ try{ P[k].pauseVideo(); }catch(e){} });
+  $('bStop').disabled=true; $('bStart').disabled=false;
+  log('STOP');
+};
+
+// seek with landing measurement: never assume it went where it was told
+function armSeek(k,target,tag){
+  T[k].ready=false;
+  T[k].readyWall=0;
+  T[k].seek={target:target,wall:now(),tag:tag};
+  try{
+    P[k].seekTo(target,true);
+    P[k].setVolume(0);
+    // once per player only: a quality change can force a stream switch and rebuffer,
+    // and doing that on every arming seek would manufacture the very gap we are hunting
+    if($('lowq').checked && !T[k].qualitySet){ T[k].qualitySet=true; try{ P[k].setPlaybackQuality('small'); }catch(e){} }
+  }catch(e){ log('seek '+k+' threw '+e,'warn'); }
+  log('seek '+k+' ('+tag+') -> '+target.toFixed(3));
+}
+
+function poll(){
+  var w=now();
+  ['A','B'].forEach(function(k){
+    var p=P[k];
+    if(!p || !p.getCurrentTime) return;
+    var t,s;
+    try{ t=p.getCurrentTime(); s=p.getPlayerState(); }catch(e){ return; }
+
+    if(s!==T[k].state){
+      var was=T[k].state;
+      T[k].state=s;
+      if(was!==-99) log('player '+k+' state '+stateName(was)+' -> '+stateName(s), s===1?'ok':((s===2||s===0)?'warn':'amber'));
+      if(s===1) T[k].everPlaying=true;
+      if(s===2 && (phase==='running'||phase==='fading')) log('player '+k+' PAUSED mid-session (ad break, user click, or lost decoder)','warn');
+      if(s===3 && (phase==='running'||phase==='fading')) log('player '+k+' buffering mid-loop; playhead extrapolation frozen','amber');
+    }
+
+    if(t!==T[k].raw){
+      if(T[k].seek && Math.abs(t-T[k].seek.target)<2.5){
+        var est=t-(w-T[k].seek.wall)/1000*(T[k].rate||cfg.rate);
+        var err=(est-T[k].seek.target)*1000;
+        log('seek '+k+' ('+T[k].seek.tag+') landed ~'+est.toFixed(3)+'  err '+err.toFixed(1)+' ms  settle '+(w-T[k].seek.wall).toFixed(0)+' ms');
+        cur.seekErr=err; cur.seekSettle=w-T[k].seek.wall;
+        T[k].lastSettle=w-T[k].seek.wall;
+        T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
+      }
+      T[k].raw=t; T[k].rawWall=w; T[k].stall=0;
+    } else {
+      T[k].stall+=POLL;
+    }
+    // staleness = ms since currentTime last moved. Healthy playback has a small nonzero
+    // floor set by the player's own update granularity; a decoder stall spikes it.
+    if(T[k].stall>T[k].staleMax) T[k].staleMax=T[k].stall;
+
+    if(T[k].seek && (w-T[k].seek.wall)>3000){
+      log('seek '+k+' ('+T[k].seek.tag+') never confirmed after 3 s; forcing ready','warn');
+      cur.seekErr=NaN; cur.seekSettle=w-T[k].seek.wall;
+      T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
+    }
+  });
+
+  // post-switch continuity monitor: did the newly-live player actually keep producing audio
+  // across the splice, or did its playhead freeze? This is the "brief pause" measurement.
+  if(watch){
+    var st=T[watch.p].stall;
+    if(st>watch.max) watch.max=st;
+    if(T[watch.p].state===3) watch.buf=true;
+    if(T[watch.p].state===2) watch.paused=true;
+    if(w>=watch.until){
+      watch.rec.gap=watch.max;
+      watch.rec.gapBase=watch.base;
+      watch.rec.gapBuf=watch.buf;
+      var excess=watch.max-watch.base;
+      if(watch.max>90||watch.buf||watch.paused){
+        log('pass '+watch.rec.n+' SPLICE GAP: new live '+watch.p+' playhead froze for '+watch.max+
+            ' ms (baseline '+watch.base+' ms, excess '+excess.toFixed(0)+' ms)'+
+            (watch.buf?' + entered BUFFERING':'')+(watch.paused?' + entered PAUSED':'')+
+            '. That is an audible dropout, not a fade artifact.','warn');
+      } else {
+        log('pass '+watch.rec.n+' splice clean: max playhead staleness '+watch.max+
+            ' ms vs baseline '+watch.base+' ms. No decoder stall - any audible dip is the fade curve, not a pause.','ok');
+      }
+      watch=null;
+    }
+  }
+
+  // rolling 1 s baseline for staleness, so the switch window has something to be compared against
+  if(qcount%50===0){
+    ['A','B'].forEach(function(k){ T[k].staleBase=T[k].staleMax; T[k].staleMax=0; });
+  }
+
+  // ad heuristic: getDuration() flips to the ad's duration while an ad plays
+  if(++qcount%25===0){
+    ['A','B'].forEach(function(k){
+      var p=P[k];
+      if(!p || !p.getDuration) return;
+      var d=0;
+      try{ d=p.getDuration(); }catch(e){ return; }
+      if(!d) return;
+      try{ if(p.getPlaybackRate) T[k].rate=p.getPlaybackRate(); }catch(e){}
+      if(!T[k].baseDur && T[k].everPlaying && d>1){ T[k].baseDur=d; log('player '+k+' baseline duration '+d.toFixed(2)+' s'); return; }
+      if(T[k].baseDur && Math.abs(d-T[k].baseDur)>1){
+        if(!T[k].adFlag){
+          T[k].adFlag=true;
+          log('player '+k+' DURATION '+T[k].baseDur.toFixed(2)+' -> '+d.toFixed(2)+'  === AD PLAYING (or video swapped) ===','warn');
+        }
+      } else if(T[k].adFlag){
+        T[k].adFlag=false;
+        log('player '+k+' duration back to baseline; ad over','ok');
+      }
+    });
+  }
+
+  // a rate mismatch between the two players makes them drift apart in media time, which
+  // shows up as a correction that will not settle
+  if(qcount%50===0 && (phase==='running'||phase==='fading') && T.A.rate!==T.B.rate && !rateMismatchLogged){
+    rateMismatchLogged=true;
+    log('RATE MISMATCH: A='+T.A.rate+'x B='+T.B.rate+'x. The players will drift apart in media time and the correction will not settle.','warn');
+  }
+
+  if(phase==='starting') tryEnterRunning();
+  else if(phase==='running') runLoop();
+}
+
+function tryEnterRunning(){
+  if(!(T.A.everPlaying && T.B.everPlaying)){
+    if(now()-startWall>5000){
+      var dead=[];
+      if(!T.A.everPlaying) dead.push('A');
+      if(!T.B.everPlaying) dead.push('B');
+      banner('PLAYER '+dead.join(' AND ')+' NEVER REACHED STATE 1 (playing) AFTER '+((now()-startWall)/1000).toFixed(1)+' s.\n'+
+             'states:  A = '+stateName(T.A.state)+'    B = '+stateName(T.B.state)+'\n'+
+             'This is the concurrent-decoder-cap failure mode: many Android WebViews and low-end devices refuse to decode two video streams at once.\n'+
+             'Tick the setPlaybackQuality(small) box, then Load and Start again. If it still will not start, two simultaneous YT players are not viable on this client.');
+    }
+    return;
+  }
+  $('banner').style.display='none';
+  try{
+    P[live].unMute();  P[live].setVolume(100);
+    P[armed].unMute(); P[armed].setVolume(0);
+    P[live].setPlaybackRate(cfg.rate);
+    P[armed].setPlaybackRate(cfg.rate);
+    P[live].seekTo(cfg.ls,true);
+  }catch(e){ log('placement threw '+e,'warn'); }
+  T[live].ready=true; T[live].seek=null; T[live].readyWall=now();
+  armSeek(armed,cfg.ls-ARM_LEAD,'initial-arm');
+  // pass 1 is a normal pass: it must re-arm like every other one. The initial arm above
+  // only exists to get the armed player playing and buffered near the region; it places
+  // it at loopStart-ARM_LEAD, which is 1.5 s behind live and NOT in loop phase.
+  cur={n:++passNo,rearmed:(cfg.le-cfg.ls)<=ARM_LEAD+0.5};
+  phase='running';
+  log('RUNNING  live='+live+' armed='+armed+'  loop '+cfg.ls+'..'+cfg.le+'  xfade '+cfg.xf+' ms  rate '+cfg.rate,'ok');
+}
+
+function runLoop(){
+  var L=proj(live), A=proj(armed);
+  var xs=cfg.xf/1000;
+  var loopDur=cfg.le-cfg.ls;
+
+  // A jump splice is pending: the only thing that matters is the armed player reaching
+  // loopStart. Loop phase is deliberately abandoned, so none of the phase logic applies.
+  if(jumpReq && !jumpReq.deferred){
+    var jok = T[armed].ready && T[armed].state===1 && T[armed].stall<=120 &&
+              T[armed].readyWall && (now()-T[armed].readyWall)>JUMP_SETTLE;
+    if(jok){
+      // the offset was fixed when the seek landed; this is what we actually got
+      var offErr=((A-L)-jumpReq.want)*1000;
+      cur.corr=0; cur.corrClamped=0; cur.trigger=L;
+      cur.jumpLatency=now()-jumpReq.wall; cur.wasJump=true; cur.jumpWant=jumpReq.want;
+      log('JUMP splice firing '+cur.jumpLatency.toFixed(0)+' ms after the button. Offset '+
+          ((A-L)).toFixed(3)+' s vs wanted '+jumpReq.want.toFixed(3)+' s, error '+offErr.toFixed(1)+
+          ' ms. live '+L.toFixed(3)+' -> '+A.toFixed(3),
+          Math.abs(offErr)<80?'ok':'warn');
+      jumpReq=null;
+      startFade(L,A); return;
+    }
+    if(now()-jumpReq.wall>5000 && !jumpReq.warned){
+      jumpReq.warned=true;
+      log('jump still pending after 5 s: armed '+armed+' is '+stateName(T[armed].state)+
+          ', ready='+T[armed].ready+', stale='+T[armed].stall+' ms.','warn');
+    }
+    return;
+  }
+
+  // Re-arm ARM_LEAD before the fade. The target is derived from where the live player
+  // ACTUALLY is rather than hardcoded to loopStart-ARM_LEAD: seeking the armed player to
+  // (live - loopDuration) is what puts it in loop phase. The two are equal only when live
+  // is exactly at loopEnd-ARM_LEAD, so deriving it self-corrects when the re-arm fires late.
+  // A seeking player's playhead FREEZES until the seek resolves while the live player keeps
+  // moving, so aiming at (live - loopDuration) using live's position at issue time lands the
+  // armed player short by exactly the settle time. Aim at where live WILL be on landing, and
+  // stretch the lead so a slow-seeking client still gets its settle plus the 400 ms guard.
+  var predSettle=(T[armed].lastSettle||300)/1000;
+  var armLead=Math.max(ARM_LEAD,predSettle+0.8);
+  if(armLead>loopDur-0.3) armLead=Math.max(0.3,loopDur-0.3);
+  cur.armLead=armLead;
+
+  if(!cur.rearmed && L>=cfg.le-armLead){
+    cur.rearmed=true;
+    var tgt=L+predSettle*(T[live].rate||cfg.rate)-loopDur;
+    if(tgt<0.3){
+      tgt=cfg.ls-armLead;
+      log('pass '+cur.n+': in-phase arm target '+(L-loopDur).toFixed(3)+' is before the video start; '+
+          'falling back to '+tgt.toFixed(3)+'. Move loopStart later than loopDuration.','warn');
+    }
+    armSeek(armed,tgt,'re-arm p'+cur.n);
+  }
+
+  // sync correction: shift the trigger so the armed player is at loopStart-xfade when the fade begins
+  var corr=(L-A)-loopDur;
+  var cc=Math.max(-MAXCORR,Math.min(MAXCORR,corr));
+  cur.corr=corr; cur.corrClamped=cc;
+  cur.trigger=cfg.le-xs+cc;
+
+  // A clamped correction does not mean "shift the trigger a bit". It means the armed
+  // player is in the wrong place entirely and the clamp is hiding it. Fading anyway
+  // splices to a wrong position, audibly. Refuse, and re-phase instead.
+  var misplaced = Math.abs(corr) > MAXCORR;
+  // "ready" only meant the seek landed. A player can report a moving currentTime while
+  // still buffering; promoting it to live in that state is an audible gap.
+  var armedPlaying = (T[armed].state===1 && T[armed].stall<=120);
+  var settled = T[armed].readyWall && (now()-T[armed].readyWall)>400;
+
+  if(L>=cur.trigger && cur.rearmed && T[armed].ready && armedPlaying && settled && !misplaced){
+    startFade(L,A); return;
+  }
+
+  if(L>=cur.trigger && cur.rearmed && !cur.warnedHold){
+    cur.warnedHold=true;
+    if(misplaced){
+      log('pass '+cur.n+': HOLDING fade. Armed '+armed+' is out of phase by '+(corr*1000).toFixed(0)+
+          ' ms (clamp is +/-'+(MAXCORR*1000)+' ms). It is at '+A.toFixed(3)+', needs '+(L-loopDur).toFixed(3)+
+          ' (last seek settle '+(T[armed].lastSettle||0).toFixed(0)+' ms)'+
+          '. Splicing now would jump to the wrong position.','warn');
+    } else {
+      log('pass '+cur.n+': holding fade. Armed '+armed+' is '+stateName(T[armed].state)+
+          ', ready='+T[armed].ready+', settled='+!!settled+', stale='+T[armed].stall+' ms.','warn');
+    }
+  }
+
+  if(L>=cfg.le+1.0){
+    // corr is fixed at the instant of the seek and does not drift afterwards, so the only
+    // route back into phase is a fresh seek to (live - loopDuration). Live overruns past
+    // loopEnd for this pass; the loop then resumes in phase, just later in the bar.
+    if(!T[armed].seek && (!cur.emergWall || now()-cur.emergWall>2500)){
+      cur.emergWall=now(); cur.missed=(cur.missed||0)+1;
+      var et=L+((T[armed].lastSettle||300)/1000)*(T[live].rate||cfg.rate)-loopDur;
+      if(et>=0.3){
+        log('MISSED PASS '+cur.n+': live overran to '+L.toFixed(3)+', armed out of phase by '+
+            (corr*1000).toFixed(0)+' ms. Re-phasing armed to '+et.toFixed(3)+'.','warn');
+        armSeek(armed,et,'re-phase p'+cur.n);
+      } else {
+        log('MISSED PASS '+cur.n+': cannot re-phase, '+et.toFixed(3)+' is before the video start.','warn');
+      }
+    }
+  }
+}
+
+function fadeGain(f){ return cfg.curve==='eq' ? Math.sqrt(f) : f; }
+
+function startFade(L,A){
+  phase='fading';
+  var xs=cfg.xf/1000;
+  cur.armedErr = (cur.jumpWant!==undefined)
+    ? ((A-L)-cur.jumpWant)*1000                   // jump: did we move by exactly one duration?
+    : (A-(cfg.ls-xs))*1000;                       // loop: residual after correction
+  cur.liveErr=(L-(cfg.le-xs))*1000;               // how far the trigger was shifted in practice
+  cur.offset=((L-cfg.le)-(A-cfg.ls))*1000;        // playhead offset in loop-relative coords
+  cur.liveT=L; cur.armedT=A;
+  cur.wall=now();
+
+  // 10 steps is only real if each step gets enough time to actually be delivered.
+  // setTimeout is clamped and jittery in the low single-digit ms, and every setVolume
+  // is a postMessage across the iframe boundary applied on the player's own event loop
+  // turn. Below MIN_STEP the ramp is not 10 steps, it is noise.
+  var steps=Math.max(2,Math.min(10,Math.floor(cfg.xf/MIN_STEP)));
+  var dt=cfg.xf/steps;
+  cur.steps=steps; cur.stepNom=dt; cur.stepWall=[];
+  if(steps<10 && !warnedSteps){
+    warnedSteps=true;
+    log('xfade '+cfg.xf+' ms gives only '+steps+' steps at the '+MIN_STEP+' ms floor ('+dt.toFixed(1)+
+        ' ms/step). 10 steps needs xfade >= '+(10*MIN_STEP)+' ms.','amber');
+  }
+  var fromP=live, toP=armed;
+  for(var i=1;i<=steps;i++){
+    (function(i){
+      setTimeout(function(){
+        var f=i/steps;
+        cur.stepWall.push(now()-cur.wall);
+        try{
+          P[fromP].setVolume(Math.round(100*fadeGain(1-f)));
+          P[toP].setVolume(Math.round(100*fadeGain(f)));
+        }catch(e){}
+        if(i===steps) finishFade(fromP,toP);
+      },dt*i);
+    })(i);
+  }
+}
+
+function finishFade(fromP,toP){
+  cur.fadeMs=now()-cur.wall;
+  // what the ramp actually did, as opposed to what it was scheduled to do
+  var iv=[];
+  for(var j=0;j<cur.stepWall.length;j++) iv.push(cur.stepWall[j]-(j?cur.stepWall[j-1]:0));
+  cur.stepMean=iv.reduce(function(a,b){ return a+b; },0)/(iv.length||1);
+  cur.stepMax=Math.max.apply(null,iv);
+  cur.stepMin=Math.min.apply(null,iv);
+  cur.stepJit=cur.stepMax-cur.stepNom;
+  try{ P[fromP].setVolume(0); P[toP].setVolume(100); }catch(e){}
+  passes.push(cur);
+  if(passes.length>200) passes.shift();
+  log('pass '+cur.n+'  armedErr '+cur.armedErr.toFixed(1)+' ms   liveErr '+cur.liveErr.toFixed(1)+
+      ' ms   corr '+(cur.corr*1000).toFixed(1)+' ms   fade wall '+cur.fadeMs.toFixed(1)+
+      ' ms ('+cur.steps+' steps, nom '+cur.stepNom.toFixed(1)+' / actual '+cur.stepMin.toFixed(1)+
+      '-'+cur.stepMax.toFixed(1)+' ms)',
+      Math.abs(cur.armedErr)<25?'ok':(Math.abs(cur.armedErr)<80?'amber':'warn'));
+
+  live=toP; armed=fromP;
+  T[armed].ready=false;
+
+  // watch the newly-live player across the splice for an actual decoder stall
+  watch={p:toP,until:now()+600,max:0,base:T[toP].staleBase,buf:false,paused:false,rec:cur};
+
+  // spec step 3 parks the retired player straight away. But a seekTo on one player can
+  // stall its sibling's decoder, and firing it at the instant of the switch puts that
+  // stall exactly where a "brief pause" would be heard. Deferring it is the A/B test:
+  // set park delay to 0 to restore the original behaviour and see if the pause returns.
+  var loopDur=cfg.le-cfg.ls;
+  var maxDelay=Math.max(0,(loopDur-ARM_LEAD)*1000-200);
+  var delay=Math.min(cfg.pd,maxDelay);
+  var parkTag='park p'+(passNo+1);
+  var parkTarget=cfg.ls-ARM_LEAD;
+  if(delay<=0){ armSeek(armed,parkTarget,parkTag); }
+  else{
+    var pk=armed;
+    setTimeout(function(){
+      if(phase!=='running'&&phase!=='fading') return;
+      if(jumpReq) return;      // a jump has taken this player over; parking would clobber its seek
+      if(pk!==armed) return;   // roles moved on
+      if(T[pk].seek) return;   // a newer seek is already in flight
+      // recompute: the loop window may have moved since this was scheduled
+      armSeek(pk,cfg.ls-ARM_LEAD,parkTag+' (+'+delay.toFixed(0)+'ms)');
+    },delay);
+  }
+  cur={ n:++passNo, rearmed: loopDur<=ARM_LEAD+0.5 };   // short loops: the park seek is the only arm
+  phase='running';
+  if(jumpReq && jumpReq.deferred){ var jw=jumpReq.why, jd=jumpReq.dir; jumpReq=null; armJump(jw+' (queued)',jd); }
+}
+
+// ---------------- loop window jumping ----------------
+// Shift the window by exactly its own length: forward -> [end, end+dur], back -> [start-dur, start].
+// A forward jump needs no seek: the new window begins where the old one ended, so the live
+// player simply plays on into it. A backward jump leaves live past the new loopEnd, so it
+// has to re-phase, which costs one pass.
+function shiftLoop(dir){
+  var ls=parseFloat($('ls').value), le=parseFloat($('le').value);
+  if(!(le>ls)){ log('loopEnd must be > loopStart','warn'); return; }
+  var dur=le-ls;
+  var nls = dir>0 ? le      : ls-dur;
+  var nle = dir>0 ? le+dur  : ls;
+  if(nls<0){ log('cannot shift back: new loopStart would be '+nls.toFixed(3)+' s','warn'); return; }
+  var dur0=T[live].baseDur||T[armed].baseDur||0;
+  if(dur0 && nle>dur0){ log('cannot shift forward: new loopEnd '+nle.toFixed(3)+' s is past the video end ('+dur0.toFixed(2)+' s)','warn'); return; }
+  $('ls').value=+nls.toFixed(3);
+  $('le').value=+nle.toFixed(3);
+  log('loop window '+(dir>0?'forward':'back')+' one length -> '+nls.toFixed(3)+' .. '+nle.toFixed(3)+' (dur '+dur.toFixed(3)+' s)');
+  if(phase==='running'||phase==='fading'){
+    cfg.ls=nls; cfg.le=nle;
+    // Both directions splice immediately. Letting live play forward into a forward-shifted
+    // window is seamless and seek-free, but costs up to a full loop length of latency; an
+    // explicit button press should land now, so we pay a splice in both directions.
+    jumpSplice(dir>0?'forward one length':'back one length',dir);
+  }
+}
+
+// A deliberate jump abandons loop phase on purpose: we want the splice to land on the new
+// loopStart, not at (live - loopDuration). So arm at loopStart-ARM_LEAD and fade when the
+// ARMED player arrives, ignoring where live is and skipping the phase checks entirely.
+// A jump moves the PLAYHEAD by one loop duration as well as the window, so you keep your
+// position within the loop instead of being thrown back to its start.
+//
+// Both players advance at the same rate, so (armed - live) is frozen the instant the seek
+// lands and never changes afterwards. That means no lead and no positional trigger are
+// needed: bake the +/- duration offset into the seek target and fade as soon as the armed
+// player is genuinely playing. The seek resolves after a settle during which live keeps
+// moving, so aim at where live WILL be on landing, using the last measured settle.
+function armJump(why,dir){
+  var dur=cfg.le-cfg.ls;
+  var r=T[live].rate||cfg.rate;
+  var predSettle=(T[armed].lastSettle||300)/1000;
+  var L0=proj(live);
+  // pressing again before the previous jump has fired must ACCUMULATE, not replace it:
+  // the bounds have already moved twice, so the playhead has to move twice too
+  var want=(jumpReq&&!jumpReq.deferred? jumpReq.want : 0)+dir*dur;
+  var tgt=L0+predSettle*r+want;
+  var vidDur=T[live].baseDur||T[armed].baseDur||0;
+  if(tgt<0.3 || (vidDur && tgt>vidDur-1)){
+    log('jump refused: target '+tgt.toFixed(3)+' s is outside the video','warn');
+    jumpReq=null; return;
+  }
+  jumpReq={wall:now(),dir:dir,want:want,warned:false};
+  cur.rearmed=true; cur.warnedHold=false; cur.emergWall=0;
+  armSeek(armed,tgt,'jump-arm');
+  log('JUMP ('+why+'): live at '+L0.toFixed(3)+', arming '+armed+' at '+tgt.toFixed(3)+
+      ' = live + '+(predSettle*r).toFixed(3)+' settle + '+want.toFixed(3)+
+      ' ('+(want/dur).toFixed(0)+' x duration). Crossfading as soon as it is playing.','amber');
+}
+
+function jumpSplice(why,dir){
+  if(phase==='fading'){
+    jumpReq={deferred:true,why:why,dir:dir,wall:now()};
+    log('jump queued: a crossfade is already in flight','amber');
+    return;
+  }
+  armJump(why,dir);
+}
+
+$('bNext').onclick=function(){ shiftLoop(1); };
+$('bPrev').onclick=function(){ shiftLoop(-1); };
+
+// ---------------- playback rate, live ----------------
+// YouTube silently ignores rates outside getAvailablePlaybackRates(), so the request is
+// verified against what the players actually report rather than assumed to have stuck.
+function applyRate(r){
+  cfg.rate=r;
+  ['A','B'].forEach(function(k){ try{ if(P[k]&&P[k].setPlaybackRate) P[k].setPlaybackRate(r); }catch(e){} });
+  setTimeout(function(){
+    var ra=null,rb=null;
+    try{ ra=P.A&&P.A.getPlaybackRate?P.A.getPlaybackRate():null; }catch(e){}
+    try{ rb=P.B&&P.B.getPlaybackRate?P.B.getPlaybackRate():null; }catch(e){}
+    if(ra===null&&rb===null) return;
+    if(ra!==r||rb!==r)
+      log('rate '+r+' requested but players report A='+ra+' B='+rb+'. Unsupported values are ignored silently; see the rates list logged at onReady.','warn');
+    else
+      log('playback rate -> '+r+'x (both players confirm)','ok');
+  },300);
+}
+$('rate').onchange=function(){ applyRate(parseFloat(this.value)); };
+function stepRate(d){
+  var sel=$('rate'), i=sel.selectedIndex+d;
+  if(i<0||i>=sel.options.length) return;
+  sel.selectedIndex=i;
+  applyRate(parseFloat(sel.value));
+}
+$('bRateUp').onclick=function(){ stepRate(1); };
+$('bRateDn').onclick=function(){ stepRate(-1); };
+
+// ---------------- readout, every frame ----------------
+function fmt(x,d){ return (x===undefined||x===null||isNaN(x)) ? '--' : Number(x).toFixed(d===undefined?1:d); }
+
+function render(){
+  function vol(k){ try{ return (P[k]&&P[k].getVolume)?P[k].getVolume():'--'; }catch(e){ return '--'; } }
+  function mut(k){ try{ return (P[k]&&P[k].isMuted&&P[k].isMuted())?' <span class="amber">M</span>':''; }catch(e){ return ''; } }
+  function line(label,a,b){ return '<tr><td class="l k">'+label+'</td><td>'+a+'</td><td>'+b+'</td></tr>'; }
+
+  var rows='<tr><th class="l"></th><th>A</th><th>B</th></tr>';
+  rows+=line('role', live==='A'?'<span class="ok">LIVE</span>':'armed', live==='B'?'<span class="ok">LIVE</span>':'armed');
+  rows+=line('currentTime', fmt(proj('A'),3), fmt(proj('B'),3));
+  rows+=line('raw poll', fmt(T.A.raw,3), fmt(T.B.raw,3));
+  rows+=line('volume', vol('A')+mut('A'), vol('B')+mut('B'));
+  rows+=line('playerState', stateName(T.A.state), stateName(T.B.state));
+  rows+=line('rate', T.A.rate+'x', T.B.rate+'x');
+  rows+=line('ever state 1', T.A.everPlaying?'<span class="ok">yes</span>':'<span class="warn">NO</span>',
+                             T.B.everPlaying?'<span class="ok">yes</span>':'<span class="warn">NO</span>');
+  rows+=line('stalled ms', T.A.stall, T.B.stall);
+  rows+=line('ad?', T.A.adFlag?'<span class="warn">AD</span>':'-', T.B.adFlag?'<span class="warn">AD</span>':'-');
+  rows+=line('duration', fmt(T.A.baseDur,2), fmt(T.B.baseDur,2));
+  $('tState').innerHTML=rows;
+
+  $('paneA').className='pane'+(live==='A'?' live':'');
+  $('paneB').className='pane'+(live==='B'?' live':'');
+  if($('roleA')) $('roleA').textContent='A  '+(live==='A'?'[LIVE]':'[armed]');
+  if($('roleB')) $('roleB').textContent='B  '+(live==='B'?'[LIVE]':'[armed]');
+
+  var xs=cfg.xf/1000;
+  var p='';
+  p+='<tr><td class="l k">phase</td><td>'+phase+'</td></tr>';
+  p+='<tr><td class="l k">pass #</td><td>'+(cur.n||0)+'</td></tr>';
+  p+='<tr><td class="l k">window</td><td>'+fmt(cfg.ls,3)+' .. '+fmt(cfg.le,3)+'</td></tr>';
+  p+='<tr><td class="l k">loop length</td><td>'+fmt(cfg.le-cfg.ls,3)+' s</td></tr>';
+  p+='<tr><td class="l k">correction</td><td>'+fmt(cur.corr*1000)+' ms</td></tr>';
+  p+='<tr><td class="l k">clamped</td><td>'+fmt(cur.corrClamped*1000)+' ms</td></tr>';
+  p+='<tr><td class="l k">trigger at</td><td>'+fmt(cur.trigger,3)+' s</td></tr>';
+  p+='<tr><td class="l k">live now</td><td>'+fmt(proj(live),3)+' s</td></tr>';
+  p+='<tr><td class="l k">to trigger</td><td>'+fmt((cur.trigger-proj(live))*1000)+' ms</td></tr>';
+  p+='<tr><td class="l k">armed ideal</td><td>'+fmt(cfg.ls-xs,3)+' s</td></tr>';
+  p+='<tr><td class="l k">armed now</td><td>'+fmt(proj(armed),3)+' s</td></tr>';
+  p+='<tr><td class="l k">armed ready</td><td>'+(T[armed].ready?'<span class="ok">yes</span>':'<span class="amber">seeking</span>')+'</td></tr>';
+  p+='<tr><td class="l k">re-armed</td><td>'+(cur.rearmed?'yes':'pending')+'</td></tr>';
+  p+='<tr><td class="l k">tab</td><td>'+(document.hidden?'<span class="warn">HIDDEN - timing invalid</span>':'visible')+'</td></tr>';
+  $('tPass').innerHTML=p;
+
+  var last=passes.slice(-20);
+  var errs=last.map(function(x){ return x.armedErr; }).filter(function(x){ return !isNaN(x); });
+  var s='';
+  if(errs.length){
+    var mn=Math.min.apply(null,errs), mx=Math.max.apply(null,errs);
+    var mean=errs.reduce(function(a,b){ return a+b; },0)/errs.length;
+    var sd=Math.sqrt(errs.reduce(function(a,b){ return a+(b-mean)*(b-mean); },0)/errs.length);
+    s+='<tr><td class="l k">n</td><td>'+errs.length+'</td></tr>';
+    s+='<tr><td class="l k">min</td><td>'+fmt(mn)+' ms</td></tr>';
+    s+='<tr><td class="l k">max</td><td>'+fmt(mx)+' ms</td></tr>';
+    s+='<tr><td class="l k">mean</td><td>'+fmt(mean)+' ms</td></tr>';
+    s+='<tr><td class="l k">sd</td><td>'+fmt(sd)+' ms</td></tr>';
+    s+='<tr><td class="l k">spread</td><td>'+fmt(mx-mn)+' ms</td></tr>';
+  } else {
+    s='<tr><td class="l k">no passes yet</td></tr>';
+  }
+  $('tStats').innerHTML=s;
+
+  var h='<table><tr><th>#</th><th class="l">gap</th><th>base</th><th>armedErr</th><th>liveErr</th><th>offset</th><th>corr</th><th>seekErr</th><th>settle</th><th>fade</th><th>steps</th><th>step max</th></tr>';
+  for(var i=last.length-1;i>=0;i--){
+    var x=last[i];
+    var cls=Math.abs(x.armedErr)<25?'ok':(Math.abs(x.armedErr)<80?'amber':'warn');
+    var scls=(x.stepMax>x.stepNom*1.5)?'warn':((x.stepMax>x.stepNom*1.2)?'amber':'ok');
+    var gcls=(x.gap===undefined)?'k':(x.gap>90||x.gapBuf?'warn':(x.gap>x.gapBase+40?'amber':'ok'));
+    h+='<tr><td>'+x.n+'</td><td class="l '+gcls+'">'+(x.gap===undefined?'--':x.gap+(x.gapBuf?' BUF':''))+
+       '</td><td class="k">'+(x.gapBase===undefined?'--':x.gapBase)+
+       '</td><td class="'+cls+'">'+fmt(x.armedErr)+'</td><td>'+fmt(x.liveErr)+'</td><td>'+fmt(x.offset)+
+       '</td><td>'+fmt(x.corr*1000)+'</td><td>'+fmt(x.seekErr)+'</td><td>'+fmt(x.seekSettle,0)+'</td><td>'+fmt(x.fadeMs)+
+       '</td><td>'+(x.steps===undefined?'--':x.steps)+'</td><td class="'+scls+'">'+fmt(x.stepMax)+'</td></tr>';
+  }
+  h+='</table>';
+  $('passes').innerHTML=h;
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
