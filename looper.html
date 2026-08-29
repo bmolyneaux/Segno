@@ -49,7 +49,14 @@
 <div id="time"></div>
 
 <script>
-var XF=250, POLL=20, STEPS=10, MAXCORR=1.25, SETTLE_MS=250, ARM_MIN=1.5;
+// XF is the real lever on how much out-of-loop material you hear: a crossfade MUST overlap
+// material from outside [loopStart, loopEnd] to hold the loop period at exactly dur, so the
+// bleed is always XF long. ALIGN only chooses which side it lands on:
+//   0   = entirely before loopStart (incoming fades in over pre-loop material)
+//   1   = entirely past loopEnd     (outgoing fades out over the next section)
+//   0.5 = split evenly across the seam
+var XF=120, ALIGN=0.5, POLL=20, STEPS=10, MAXCORR=1.25, SETTLE_MS=250, ARM_MIN=1.5;
+var MIN_STEP=20;   // ms; below this setTimeout jitter and postMessage latency dominate
 
 var $=function(s){ return document.getElementById(s); };
 var P={A:null,B:null}, live='A', armed='B';
@@ -255,12 +262,10 @@ function runLoop(){
   }
 
   var corr=(L-A)-dur;
-  // Tail overlap. Triggering at loopEnd-xfade would put the incoming player at
-  // loopStart-xfade when the fade BEGINS, so a whole crossfade of pre-loopStart material
-  // fades in -- audibly "seeking too early" once the fade is long. Trigger at loopEnd
-  // instead: the incoming starts exactly on loopStart and the outgoing runs past loopEnd
-  // while fading out, which is its natural continuation and is masked by the fade.
-  var trigger=cfg.le+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
+  // Where the crossfade sits relative to the seam. At ALIGN=0 the incoming starts at
+  // loopStart-XF, so pre-loop material fades in; at ALIGN=1 the outgoing runs to loopEnd+XF,
+  // so the next section fades out. Neither is free -- see the note on XF above.
+  var trigger=cfg.le-(XF/1000)*(1-ALIGN)+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
@@ -304,14 +309,18 @@ function learnTrim(k,corr){
 // ---------- crossfade ----------
 function fade(){
   phase='fading';
-  var from=live, to=armed, dt=XF/STEPS;
-  for(var i=1;i<=STEPS;i++){
+  // 10 steps only if each gets enough time to actually be delivered: setTimeout is clamped
+  // and jittery, and every setVolume is a postMessage applied on the player's own event turn.
+  var from=live, to=armed;
+  var steps=Math.max(2,Math.min(STEPS,Math.floor(XF/MIN_STEP)));
+  var dt=XF/steps;
+  for(var i=1;i<=steps;i++){
     (function(i){
       setTimeout(function(){
-        var f=i/STEPS;
+        var f=i/steps;
         one(from,function(p){ p.setVolume(Math.round(100*Math.sqrt(1-f))); });   // equal power
         one(to,  function(p){ p.setVolume(Math.round(100*Math.sqrt(f))); });
-        if(i===STEPS) done(from,to);
+        if(i===steps) done(from,to);
       },dt*i);
     })(i);
   }
