@@ -78,6 +78,34 @@ function parseId(s){
   return /^[A-Za-z0-9_-]{6,}$/.test(s)?s:'';
 }
 
+// ---------- URL parameters ----------
+// ?v=<id|url>&ls=<sec>&le=<sec> seeds the fields; every later change writes back, so the
+// address bar is always a shareable link to the current loop.
+function readParams(){
+  var q=new URLSearchParams(location.search);
+  var id=parseId(q.get('v')||q.get('url')||'');
+  if(id) $('url').value='https://www.youtube.com/watch?v='+id;
+  var a=parseFloat(q.get('ls')), b=parseFloat(q.get('le'));
+  if(!isNaN(a)&&!isNaN(b)&&a>=0&&b>a){ cfg.ls=a; cfg.le=b; }
+  else if(!isNaN(a)&&a>=0&&a<cfg.le) cfg.ls=a;
+  else if(!isNaN(b)&&b>cfg.ls) cfg.le=b;
+  $('ls').value=+cfg.ls.toFixed(3);
+  $('le').value=+cfg.le.toFixed(3);
+}
+
+function pushParams(){
+  var q=new URLSearchParams(location.search);
+  var id=parseId($('url').value);
+  q.delete('url');
+  if(id) q.set('v',id); else q.delete('v');
+  q.set('ls',+cfg.ls.toFixed(3));
+  q.set('le',+cfg.le.toFixed(3));
+  // file:// forbids replaceState in some browsers; the page must not die over a URL
+  try{ history.replaceState(null,'','?'+q.toString()+location.hash); }catch(e){}
+}
+
+readParams();
+
 // ---------- load ----------
 var tag=document.createElement('script');
 tag.src='https://www.youtube.com/iframe_api';
@@ -93,7 +121,7 @@ function tryLoad(){
   if(!apiReady) return;
   var id=parseId($('url').value);
   if(!id || id===cfg.id) return;
-  cfg.id=id; vidDur=0;
+  cfg.id=id; vidDur=0; pushParams();
   if(!P.A) create(); else { ['A','B'].forEach(function(k){ P[k].loadVideoById(id); }); start(); }
 }
 
@@ -374,8 +402,8 @@ document.addEventListener('keydown',function(e){
 });
 
 // ---------- bounds + rate ----------
-function syncInputs(){ $('ls').value=+cfg.ls.toFixed(3); $('le').value=+cfg.le.toFixed(3); }
-function boundsChanged(){ cur.rearmed=false; }
+function syncInputs(){ $('ls').value=+cfg.ls.toFixed(3); $('le').value=+cfg.le.toFixed(3); pushParams(); }
+function boundsChanged(){ cur.rearmed=false; pushParams(); }
 
 $('ls').onchange=function(){
   var v=parseFloat(this.value);
