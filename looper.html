@@ -244,7 +244,12 @@ function runLoop(){
   }
 
   var corr=(L-A)-dur;
-  var trigger=cfg.le-xs+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
+  // Tail overlap. Triggering at loopEnd-xfade would put the incoming player at
+  // loopStart-xfade when the fade BEGINS, so a whole crossfade of pre-loopStart material
+  // fades in -- audibly "seeking too early" once the fade is long. Trigger at loopEnd
+  // instead: the incoming starts exactly on loopStart and the outgoing runs past loopEnd
+  // while fading out, which is its natural continuation and is masked by the fade.
+  var trigger=cfg.le+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
