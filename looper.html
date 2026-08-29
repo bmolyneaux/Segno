@@ -49,7 +49,7 @@
 <div id="time"></div>
 
 <script>
-var XF=250, POLL=20, STEPS=10, MAXCORR=0.75, JUMP_SETTLE=250, ARM_MIN=1.5;
+var XF=250, POLL=20, STEPS=10, MAXCORR=1.25, JUMP_SETTLE=250, ARM_MIN=1.5;
 
 var $=function(s){ return document.getElementById(s); };
 var P={A:null,B:null}, live='A', armed='B';
@@ -58,7 +58,7 @@ var cfg={id:'',ls:18.1,le:25.7,rate:1};
 var T={A:trk(),B:trk()};
 var poller=null, cur={}, jumpReq=null, vidDur=0, apiReady=false, loadT=null, paused=false, nudge=0;
 
-function trk(){ return {raw:-1,rawWall:0,st:-99,play:false,ready:false,readyWall:0,seek:null,settle:300,rate:1,stall:0}; }
+function trk(){ return {raw:-1,rawWall:0,st:-99,play:false,ready:false,readyWall:0,seek:null,settle:300,rate:1,stall:0,trim:0}; }
 function now(){ return performance.now(); }
 
 // interpolate between polls; cap so a stall cannot run away
@@ -114,7 +114,13 @@ function start(){
   ['A','B'].forEach(function(k){
     try{ P[k].mute(); P[k].setVolume(0); P[k].setPlaybackRate(cfg.rate); P[k].playVideo(); }catch(e){}
   });
-  if(!poller) poller=setInterval(poll,POLL);
+  if(!poller){
+    poller=setInterval(poll,POLL);
+    // setInterval is coalesced when the main thread is busy (two video decoders on a
+    // phone will do it). rAF runs at display rate while visible; the interval remains
+    // as the backstop for when the tab is hidden.
+    (function raf(){ requestAnimationFrame(function(){ poll(); raf(); }); })();
+  }
 }
 
 // autoplay fallback: only while still trying to start, so it cannot fight a deliberate pause
@@ -145,7 +151,8 @@ function poll(){
         T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
       }
       T[k].raw=t; T[k].rawWall=w; T[k].stall=0;
-    } else T[k].stall+=POLL;
+    }
+    T[k].stall=w-T[k].rawWall;    // wall-based: poll cadence is not fixed on mobile
     if(T[k].seek && w-T[k].seek.wall>3000){ T[k].seek=null; T[k].ready=true; T[k].readyWall=w; }
   });
 
@@ -219,7 +226,7 @@ function runLoop(){
   if(lead>dur-0.3) lead=Math.max(0.3,dur-0.3);
 
   if(!cur.rearmed && L>=cfg.le-lead){
-    var tgt=L+ps*(T[live].rate||cfg.rate)-dur;
+    var tgt=L+ps*(T[live].rate||cfg.rate)-dur+T[armed].trim;
     if(tgt>=0.3){ cur.rearmed=true; seek(armed,tgt); }
   }
 
@@ -228,7 +235,7 @@ function runLoop(){
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
-  if(L>=trigger && cur.rearmed && settledArmed && Math.abs(corr)<=MAXCORR){ fade(); return; }
+  if(L>=trigger && cur.rearmed && settledArmed && Math.abs(corr)<=MAXCORR){ cur.corrAtFade=corr; fade(); return; }
 
   // Recovery must fire ONCE and then wait: re-seeking every poll resets the armed player's
   // settle clock, so it never becomes usable and playback runs away forever.
@@ -267,6 +274,14 @@ function fade(){
 
 function done(from,to){
   try{ P[from].setVolume(0); P[to].setVolume(100); }catch(e){}
+  // Feed the residual back into the seek target for the player we just seeked. corr is
+  // (actualSettle - predictedSettle)*rate - landingBias; rather than model either term,
+  // integrate the observed error so it converges whatever the cause. Matters on mobile,
+  // where keyframe snapping and main-thread jank make both terms large.
+  if(cur.corrAtFade!==undefined){
+    var tr=T[to].trim+0.5*cur.corrAtFade;
+    T[to].trim=Math.max(-2,Math.min(2,tr));
+  }
   live=to; armed=from;
   T[armed].ready=false;
   cur={rearmed:false};
@@ -309,7 +324,7 @@ function armJump(want){
   }
   var w=(jumpReq && !jumpReq.deferred ? jumpReq.want : 0)+want;   // repeat presses accumulate
   var ps=T[armed].settle/1000, r=T[live].rate||cfg.rate;
-  var tgt=proj(live)+ps*r+w;
+  var tgt=proj(live)+ps*r+w+T[armed].trim;
   if(tgt<0.3 || (vidDur && tgt>vidDur-1)){ jumpReq=null; return; }
   jumpReq={want:w};
   cur.rearmed=true;
