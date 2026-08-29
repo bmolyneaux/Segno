@@ -33,7 +33,7 @@
   <button id="fwd">&raquo;</button>
   <select id="rate"><option>0.5</option><option>0.75</option><option selected>1</option></select>
   <label>lead ms <input type="number" id="lead" value="0" step="25" style="width:60px"></label>
-  <span id="ver" style="color:#666">v1</span>
+  <span id="ver" style="color:#666">v2</span>
 </div>
 
 <div id="stage">
@@ -262,6 +262,9 @@ function runLoop(){
   // part of the fade always sits on correct material. Analytically the incoming is at
   // loopStart-XF when the fade begins, at loopStart when it ends.
   var trigger=cfg.le-xs-leadS+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
+  // surfaced in the time line so a device can show WHY the fade is being held
+  cur.dbg='corr '+(corr*1000).toFixed(0)+'ms trim '+(T[armed].trim*1000).toFixed(0)+
+          (T[armed].seek?' SEEKING':'')+(settledArmed?'':' ARMED-NOT-READY');
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
@@ -463,7 +466,8 @@ function render(){
     $('hStart').style.left=a+'%';
     $('hEnd').style.left=b+'%';
     $('head').style.left=(100*L/vidDur)+'%';
-    $('time').textContent=fmt(L)+'   loop '+fmt(cfg.ls)+' - '+fmt(cfg.le)+'   ('+(cfg.le-cfg.ls).toFixed(2)+'s)'+(paused?'   PAUSED':'');
+    $('time').textContent=fmt(L)+'   loop '+fmt(cfg.ls)+' - '+fmt(cfg.le)+'   ('+(cfg.le-cfg.ls).toFixed(2)+'s)'+(paused?'   PAUSED':'')+
+      '   armed '+fmt(proj(armed))+'   '+(cur.dbg||'');
   }
   requestAnimationFrame(render);
 }
