@@ -32,8 +32,6 @@
   <button id="back">&laquo;</button>
   <button id="fwd">&raquo;</button>
   <select id="rate"><option>0.5</option><option>0.75</option><option selected>1</option></select>
-  <label>lead ms <input type="number" id="lead" value="0" step="25" style="width:60px"></label>
-  <span id="ver" style="color:#666">v2</span>
 </div>
 
 <div id="stage">
@@ -51,8 +49,7 @@
 <div id="time"></div>
 
 <script>
-var XF=80, POLL=20, STEPS=10, MAXCORR=1.25, JUMP_SETTLE=250, ARM_MIN=1.5;
-var MIN_STEP=20;   // ms; below this setTimeout jitter and postMessage latency swamp the ramp
+var XF=250, POLL=20, STEPS=10, MAXCORR=1.25, SETTLE_MS=250, ARM_MIN=1.5;
 
 var $=function(s){ return document.getElementById(s); };
 var P={A:null,B:null}, live='A', armed='B';
@@ -65,11 +62,22 @@ function trk(){ return {raw:-1,rawWall:0,st:-99,play:false,ready:false,readyWall
 function now(){ return performance.now(); }
 
 // interpolate between polls; cap so a stall cannot run away
+function rateOf(k){ return T[k].rate||cfg.rate; }
+
+// Every player call can throw if the iframe is not ready yet, so they were all individually
+// wrapped. One place to do it.
+function both(fn){ ['A','B'].forEach(function(k){ try{ fn(P[k],k); }catch(e){} }); }
+function one(k,fn){ try{ fn(P[k]); }catch(e){} }
+
+// The armed player's placement is invalid: re-run the re-arm on the next poll.
+function reArm(){ cur.rearmed=false; }
+
 function proj(k){
   var t=T[k];
   if(t.raw<0) return 0;
+  if(paused) return t.raw;                       // stopped: never extrapolate a frozen playhead
   var cap=Math.max(0.5,2.5*(t.tick||16)/1000);   // never freeze mid-report-interval
-  var d=(now()-t.rawWall)/1000*(t.rate||cfg.rate);
+  var d=(now()-t.rawWall)/1000*rateOf(k);
   return t.raw+(d>cap?cap:d);
 }
 
@@ -97,7 +105,8 @@ function tryLoad(){
   var id=parseId($('url').value);
   if(!id || id===cfg.id) return;
   cfg.id=id; vidDur=0;
-  if(!P.A) create(); else { ['A','B'].forEach(function(k){ P[k].loadVideoById(id); }); start(); }
+  if(!P.A) create();
+  else { both(function(p){ p.loadVideoById(id); }); start(); }
 }
 
 function create(){
@@ -115,9 +124,7 @@ function start(){
   phase='starting'; paused=false; nudge=now();
   T.A=trk(); T.B=trk();
   live='A'; armed='B'; jumpReq=null; cur={};
-  ['A','B'].forEach(function(k){
-    try{ P[k].mute(); P[k].setVolume(0); P[k].setPlaybackRate(cfg.rate); P[k].playVideo(); }catch(e){}
-  });
+  both(function(p){ p.mute(); p.setVolume(0); p.setPlaybackRate(cfg.rate); p.playVideo(); });
   if(!poller){
     poller=setInterval(poll,POLL);
     // setInterval is coalesced when the main thread is busy (two video decoders on a
@@ -130,14 +137,21 @@ function start(){
 // autoplay fallback: only while still trying to start, so it cannot fight a deliberate pause
 document.addEventListener('pointerdown',function(){
   if(phase!=='starting') return;
-  ['A','B'].forEach(function(k){ try{ P[k].unMute(); P[k].playVideo(); }catch(e){} });
+  both(function(p){ p.unMute(); p.playVideo(); });
 });
 
 // ---------- seeking ----------
+// Aim the armed player at (live + offset). Its playhead freezes while the seek resolves
+// while live keeps moving, so target where live WILL be on landing; trim carries the
+// integrated residual from previous passes. All three arming sites go through this.
+function armTarget(offset){
+  return proj(live)+(T[armed].settle/1000)*rateOf(live)+offset+T[armed].trim;
+}
+
 function seek(k,target){
   T[k].ready=false; T[k].readyWall=0;
   T[k].seek={target:target,wall:now()};
-  try{ P[k].seekTo(target,true); P[k].setVolume(0); }catch(e){}
+  one(k,function(p){ p.seekTo(target,true); p.setVolume(0); });
 }
 
 // ---------- poll ----------
@@ -160,14 +174,14 @@ function poll(){
         T[k].settle=w-T[k].seek.wall;      // measured, feeds the next seek's aim
         T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
       }
-      T[k].raw=t; T[k].rawWall=w; T[k].stall=0;
+      T[k].raw=t; T[k].rawWall=w;
     }
     T[k].stall=w-T[k].rawWall;    // wall-based: poll cadence is not fixed on mobile
     if(T[k].seek && w-T[k].seek.wall>3000){ T[k].seek=null; T[k].ready=true; T[k].readyWall=w; }
   });
 
-  if(!vidDur){ try{ var d=P[live].getDuration(); if(d>1) vidDur=d; }catch(e){} }
-  try{ T.A.rate=P.A.getPlaybackRate(); T.B.rate=P.B.getPlaybackRate(); }catch(e){}
+  if(!vidDur) one(live,function(p){ var d=p.getDuration(); if(d>1) vidDur=d; });
+  both(function(p,k){ T[k].rate=p.getPlaybackRate(); });
 
   reconcile();
 
@@ -182,14 +196,14 @@ function reconcile(){
   var lv=T[live].st, av=T[armed].st;
   if(!paused && lv===2){                       // paused from the embed
     paused=true;
-    try{ P[armed].pauseVideo(); }catch(e){}
+    one(armed,function(p){ p.pauseVideo(); });
   } else if(paused && lv===1){                 // resumed from the embed
     paused=false;
-    try{ P[armed].playVideo(); }catch(e){}
-    cur.rearmed=false;                         // re-establish phase after the gap
+    one(armed,function(p){ p.playVideo(); });
+    reArm();                                   // re-establish phase across the gap
   } else if(!paused && av===2){                // only the armed one stopped
-    try{ P[armed].playVideo(); }catch(e){}
-    cur.rearmed=false;
+    one(armed,function(p){ p.playVideo(); });
+    reArm();
   }
 }
 
@@ -207,17 +221,12 @@ function tryRun(){
     // autoplay is permitted.
     if(now()-nudge>700){
       nudge=now();
-      ['A','B'].forEach(function(k){
-        if(T[k].st!==1){ try{ P[k].mute(); P[k].playVideo(); }catch(e){} }
-      });
+      both(function(p,k){ if(T[k].st!==1){ p.mute(); p.playVideo(); } });
     }
     return;
   }
-  try{
-    P[live].unMute();  P[live].setVolume(100);
-    P[armed].unMute(); P[armed].setVolume(0);
-    P[live].seekTo(cfg.ls,true);
-  }catch(e){}
+  one(live,function(p){ p.unMute(); p.setVolume(100); p.seekTo(cfg.ls,true); });
+  one(armed,function(p){ p.unMute(); p.setVolume(0); });
   T[live].ready=true; T[live].readyWall=now();
   seek(armed,Math.max(0,cfg.ls-ARM_MIN));
   cur={rearmed:false};
@@ -225,9 +234,9 @@ function tryRun(){
 }
 
 function runLoop(){
-  var L=proj(live), A=proj(armed), dur=cfg.le-cfg.ls, xs=XF/1000;
+  var L=proj(live), A=proj(armed), dur=cfg.le-cfg.ls;
   var settledArmed = T[armed].ready && T[armed].st===1 && T[armed].stall<=stallLimit(armed) &&
-                     T[armed].readyWall && now()-T[armed].readyWall>JUMP_SETTLE;
+                     T[armed].readyWall && now()-T[armed].readyWall>SETTLE_MS;
 
   // a jump owns the armed player until it fires
   if(jumpReq && !jumpReq.deferred){
@@ -237,34 +246,21 @@ function runLoop(){
 
   // A seeking player's playhead freezes while live keeps moving, so aim at where live WILL
   // be when the seek lands, and give the lead room for that settle plus the ready guard.
-  var ps=T[armed].settle/1000;
-  var lead=Math.max(ARM_MIN,ps+0.8);
+  var lead=Math.max(ARM_MIN,T[armed].settle/1000+0.8);
   if(lead>dur-0.3) lead=Math.max(0.3,dur-0.3);
 
   if(!cur.rearmed && L>=cfg.le-lead){
-    var tgt=L+ps*(T[live].rate||cfg.rate)-dur+T[armed].trim;
+    var tgt=armTarget(-dur);
     if(tgt>=0.3){ cur.rearmed=true; seek(armed,tgt); }
   }
 
   var corr=(L-A)-dur;
-  // Wall-clock latency compensation, dialed by ear. Device evidence: overshoot past
-  // loopEnd scales with playback rate, i.e. a fixed WALL duration separates our position
-  // estimate from the audible result (stale currentTime at delivery, iframe event-loop
-  // lag applying setVolume, detection lag -- indistinguishable from here). Triggering
-  // early by that wall duration cancels it; the value that nulls the overshoot on a
-  // device IS that device's total latency. Desktop default 0.
-  var leadS=((parseFloat($('lead').value)||0)/1000)*(T[live].rate||cfg.rate);
-  // The fade must COMPLETE at loopEnd, not start there. Triggering at loopEnd runs the
-  // outgoing XF wall-ms past the end at audible volume -- heard as overshooting the loop,
-  // scaling with playback rate (confirmed on device: half as far at 0.5x). Triggering at
-  // loopEnd-XF instead puts the whole bleed BEFORE loopStart on the incoming side, where
-  // it enters at zero volume and only reaches full level exactly at loopStart -- the loud
-  // part of the fade always sits on correct material. Analytically the incoming is at
-  // loopStart-XF when the fade begins, at loopStart when it ends.
-  var trigger=cfg.le-xs-leadS+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
-  // surfaced in the time line so a device can show WHY the fade is being held
-  cur.dbg='corr '+(corr*1000).toFixed(0)+'ms trim '+(T[armed].trim*1000).toFixed(0)+
-          (T[armed].seek?' SEEKING':'')+(settledArmed?'':' ARMED-NOT-READY');
+  // Tail overlap. Triggering at loopEnd-xfade would put the incoming player at
+  // loopStart-xfade when the fade BEGINS, so a whole crossfade of pre-loopStart material
+  // fades in -- audibly "seeking too early" once the fade is long. Trigger at loopEnd
+  // instead: the incoming starts exactly on loopStart and the outgoing runs past loopEnd
+  // while fading out, which is its natural continuation and is masked by the fade.
+  var trigger=cfg.le+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
@@ -274,7 +270,7 @@ function runLoop(){
   // settle clock, so it never becomes usable and playback runs away forever.
   if(L>=cfg.le+1.0 && !T[armed].seek && (!cur.recov || now()-cur.recov>1200)){
     cur.recov=now();
-    var et=L+ps*(T[live].rate||cfg.rate)-dur;
+    var et=armTarget(-dur);
     if(et>=0.3) seek(armed,et);
   }
 
@@ -282,42 +278,38 @@ function runLoop(){
   // Audible, but the loop is never lost.
   if(L>cfg.le+3.0 && (!cur.hard || now()-cur.hard>3000)){
     cur.hard=now();
-    try{ P[live].seekTo(cfg.ls+wrapIntoLoop(L),true); }catch(e){}
-    cur.rearmed=false;
+    one(live,function(p){ p.seekTo(cfg.ls+wrapIntoLoop(L),true); });
+    reArm();
   }
 }
 
 // ---------- crossfade ----------
 function fade(){
   phase='fading';
-  // 10 steps only if each gets >= MIN_STEP ms: setTimeout is clamped and jittery, and
-  // every setVolume is a postMessage applied on the player's own event-loop turn.
-  var from=live, to=armed;
-  var steps=Math.max(2,Math.min(STEPS,Math.floor(XF/MIN_STEP)));
-  var dt=XF/steps;
-  for(var i=1;i<=steps;i++){
+  var from=live, to=armed, dt=XF/STEPS;
+  for(var i=1;i<=STEPS;i++){
     (function(i){
       setTimeout(function(){
-        var f=i/steps;
-        try{
-          P[from].setVolume(Math.round(100*Math.sqrt(1-f)));   // equal power
-          P[to].setVolume(Math.round(100*Math.sqrt(f)));
-        }catch(e){}
-        if(i===steps) done(from,to);
+        var f=i/STEPS;
+        one(from,function(p){ p.setVolume(Math.round(100*Math.sqrt(1-f))); });   // equal power
+        one(to,  function(p){ p.setVolume(Math.round(100*Math.sqrt(f))); });
+        if(i===STEPS) done(from,to);
       },dt*i);
     })(i);
   }
 }
 
 function done(from,to){
-  try{ P[from].setVolume(0); P[to].setVolume(100); }catch(e){}
-  // Feed the residual back into the seek target for the player we just seeked. corr is
-  // (actualSettle - predictedSettle)*rate - landingBias; rather than model either term,
-  // integrate the observed error so it converges whatever the cause. Matters on mobile,
-  // where keyframe snapping and main-thread jank make both terms large.
+  one(from,function(p){ p.setVolume(0); });
+  one(to,  function(p){ p.setVolume(100); });
+  // Feed the residual back into the seek target for the player we just seeked. Measured
+  // on-device, seeks land accurately and settle is ~20 ms, so this is NOT correcting a
+  // landing bias -- it absorbs whatever is left (decoder catch-up after a seek, settle
+  // misprediction) without needing to model it. Gain and clamp are deliberately modest:
+  // corr carries measurement noise, and this feeds straight into a real seek target.
   if(cur.corrAtFade!==undefined){
-    var tr=T[to].trim+0.5*cur.corrAtFade;
-    T[to].trim=Math.max(-2,Math.min(2,tr));
+    var tr=T[to].trim+0.25*cur.corrAtFade;
+    T[to].trim=Math.max(-1,Math.min(1,tr));
   }
   live=to; armed=from;
   T[armed].ready=false;
@@ -340,13 +332,16 @@ function jumpBy(n){
   var dur=cfg.le-cfg.ls;
   var nls=cfg.ls+n*dur, nle=cfg.le+n*dur;
   if(nls<0 || (vidDur && nle>vidDur)) return;
-  var L=paused?T[live].raw:proj(live);
-  var want=(nls+wrapIntoLoop(L))-L;            // n*dur exactly when already inside the loop
+  var L=proj(live);
+  // With a jump already pending, that jump will land us in phase, so this press only adds
+  // its own n*dur. Computing the absolute offset again would double-count what is pending.
+  // wrapIntoLoop must be read BEFORE the window moves, and folds an escaped playhead back in.
+  var want=jumpReq ? n*dur : (nls+wrapIntoLoop(L))-L;
   cfg.ls=nls; cfg.le=nle; syncInputs();
   if(paused){
     var t=L+want;
-    if(t>=0){ try{ P[live].seekTo(t,true); }catch(e){} }
-    cur.rearmed=false;
+    if(t>=0) one(live,function(p){ p.seekTo(t,true); });
+    reArm();
     return;
   }
   if(phase==='running'||phase==='fading') armJump(want);
@@ -360,8 +355,7 @@ function armJump(want){
     return;
   }
   var w=(jumpReq && !jumpReq.deferred ? jumpReq.want : 0)+want;   // repeat presses accumulate
-  var ps=T[armed].settle/1000, r=T[live].rate||cfg.rate;
-  var tgt=proj(live)+ps*r+w+T[armed].trim;
+  var tgt=armTarget(w);
   if(tgt<0.3 || (vidDur && tgt>vidDur-1)){ jumpReq=null; return; }
   jumpReq={want:w};
   cur.rearmed=true;
@@ -378,10 +372,8 @@ $('back').onclick=function(){ jumpBy(-1); };
 function togglePlay(){
   if(phase!=='running' && phase!=='fading') return;
   paused=!paused;
-  ['A','B'].forEach(function(k){
-    try{ paused ? P[k].pauseVideo() : P[k].playVideo(); }catch(e){}
-  });
-  if(!paused) cur.rearmed=false;
+  both(function(p){ paused ? p.pauseVideo() : p.playVideo(); });
+  if(!paused) reArm();
 }
 
 document.addEventListener('keydown',function(e){
@@ -394,21 +386,20 @@ document.addEventListener('keydown',function(e){
 
 // ---------- bounds + rate ----------
 function syncInputs(){ $('ls').value=+cfg.ls.toFixed(3); $('le').value=+cfg.le.toFixed(3); }
-function boundsChanged(){ cur.rearmed=false; }
 
 $('ls').onchange=function(){
   var v=parseFloat(this.value);
   if(isNaN(v)||v<0||v>=cfg.le) return syncInputs();
-  cfg.ls=v; boundsChanged();
+  cfg.ls=v; reArm();
 };
 $('le').onchange=function(){
   var v=parseFloat(this.value);
   if(isNaN(v)||v<=cfg.ls) return syncInputs();
-  cfg.le=v; boundsChanged();
+  cfg.le=v; reArm();
 };
 $('rate').onchange=function(){
   cfg.rate=parseFloat(this.value);
-  ['A','B'].forEach(function(k){ try{ P[k].setPlaybackRate(cfg.rate); }catch(e){} });
+  both(function(p){ p.setPlaybackRate(cfg.rate); });
 };
 
 // ---------- seek bar ----------
@@ -446,9 +437,9 @@ bar.addEventListener('pointerup',function(e){
   var v=d.base+d.n*d.step;
   if(d.id==='head'){ jumpBy(d.n); }
   else if(d.id==='hStart'){
-    if(v>=0 && v<=cfg.le-d.step){ cfg.ls=v; syncInputs(); boundsChanged(); }
+    if(v>=0 && v<=cfg.le-d.step){ cfg.ls=v; syncInputs(); reArm(); }
   } else {
-    if(v>=cfg.ls+d.step && (!vidDur||v<=vidDur)){ cfg.le=v; syncInputs(); boundsChanged(); }
+    if(v>=cfg.ls+d.step && (!vidDur||v<=vidDur)){ cfg.le=v; syncInputs(); reArm(); }
   }
 });
 
@@ -466,8 +457,7 @@ function render(){
     $('hStart').style.left=a+'%';
     $('hEnd').style.left=b+'%';
     $('head').style.left=(100*L/vidDur)+'%';
-    $('time').textContent=fmt(L)+'   loop '+fmt(cfg.ls)+' - '+fmt(cfg.le)+'   ('+(cfg.le-cfg.ls).toFixed(2)+'s)'+(paused?'   PAUSED':'')+
-      '   armed '+fmt(proj(armed))+'   '+(cur.dbg||'');
+    $('time').textContent=fmt(L)+'   loop '+fmt(cfg.ls)+' - '+fmt(cfg.le)+'   ('+(cfg.le-cfg.ls).toFixed(2)+'s)'+(paused?'   PAUSED':'');
   }
   requestAnimationFrame(render);
 }
