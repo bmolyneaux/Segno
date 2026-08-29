@@ -56,7 +56,7 @@ var P={A:null,B:null}, live='A', armed='B';
 var phase='idle';                       // idle | starting | running | fading
 var cfg={id:'',ls:18.1,le:25.7,rate:1};
 var T={A:trk(),B:trk()};
-var poller=null, cur={}, jumpReq=null, vidDur=0, apiReady=false, loadT=null, paused=false;
+var poller=null, cur={}, jumpReq=null, vidDur=0, apiReady=false, loadT=null, paused=false, nudge=0;
 
 function trk(){ return {raw:-1,rawWall:0,st:-99,play:false,ready:false,readyWall:0,seek:null,settle:300,rate:1,stall:0}; }
 function now(){ return performance.now(); }
@@ -108,7 +108,7 @@ function create(){
 }
 
 function start(){
-  phase='starting'; paused=false;
+  phase='starting'; paused=false; nudge=now();
   T.A=trk(); T.B=trk();
   live='A'; armed='B'; jumpReq=null; cur={};
   ['A','B'].forEach(function(k){
@@ -117,11 +117,11 @@ function start(){
   if(!poller) poller=setInterval(poll,POLL);
 }
 
-// autoplay fallback: if the browser blocked the unmuted start, the first click fixes it
+// autoplay fallback: only while still trying to start, so it cannot fight a deliberate pause
 document.addEventListener('pointerdown',function(){
-  if(phase==='idle') return;
+  if(phase!=='starting') return;
   ['A','B'].forEach(function(k){ try{ P[k].unMute(); P[k].playVideo(); }catch(e){} });
-},{once:true});
+});
 
 // ---------- seeking ----------
 function seek(k,target){
@@ -152,12 +152,44 @@ function poll(){
   if(!vidDur){ try{ var d=P[live].getDuration(); if(d>1) vidDur=d; }catch(e){} }
   try{ T.A.rate=P.A.getPlaybackRate(); T.B.rate=P.B.getPlaybackRate(); }catch(e){}
 
+  reconcile();
+
   if(phase==='starting') tryRun();
   else if(phase==='running' && !paused) runLoop();
 }
 
+// Clicking the embed toggles YouTube's own play/pause on ONE player. The engine assumes it
+// is the only thing driving playback, so mirror any state it did not initiate.
+function reconcile(){
+  if(phase!=='running') return;
+  var lv=T[live].st, av=T[armed].st;
+  if(!paused && lv===2){                       // paused from the embed
+    paused=true;
+    try{ P[armed].pauseVideo(); }catch(e){}
+  } else if(paused && lv===1){                 // resumed from the embed
+    paused=false;
+    try{ P[armed].playVideo(); }catch(e){}
+    cur.rearmed=false;                         // re-establish phase after the gap
+  } else if(!paused && av===2){                // only the armed one stopped
+    try{ P[armed].playVideo(); }catch(e){}
+    cur.rearmed=false;
+  }
+}
+
 function tryRun(){
-  if(!(T.A.play && T.B.play)) return;
+  if(!(T.A.play && T.B.play)){
+    // Autoplay may have been blocked, in which case the user starts playback by clicking
+    // the embed -- but they can only see the live player, so the other one never starts
+    // and the loop never begins. Nudge whichever is not playing; it is muted, and muted
+    // autoplay is permitted.
+    if(now()-nudge>700){
+      nudge=now();
+      ['A','B'].forEach(function(k){
+        if(T[k].st!==1){ try{ P[k].mute(); P[k].playVideo(); }catch(e){} }
+      });
+    }
+    return;
+  }
   try{
     P[live].unMute();  P[live].setVolume(100);
     P[armed].unMute(); P[armed].setVolume(0);
