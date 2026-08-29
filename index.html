@@ -87,6 +87,8 @@
 At <code>loopEnd - xfade + correction</code> the two volumes are ramped past each other in 10 <code>setVolume</code> steps, then the roles swap.
 <code>correction = (liveTime - armedTime) - loopDuration</code>, recomputed on every 20&nbsp;ms poll from sub-poll-interpolated playheads &mdash; i.e. the fade trigger is slaved to where the armed player <i>actually</i> is, not to where its seek was told to land. <b>armedErr</b> is what survives that correction; watch whether it converges or wanders.
 <br><br>
+<b>Reading seekErr.</b> It is <code>landedPosition - requestedTarget</code>, where the landed position is simply the first <code>currentTime</code> observed after the seek. The playhead is <i>frozen</i> while a seek resolves, so it must not be back-projected by the settle interval &mdash; an earlier version of this page did exactly that, which made a perfectly exact seek report <code>err = -settle</code>. If you see that pattern, the seek was accurate and the metric was lying. The player may have resumed playing anywhere within the last poll interval before we sampled it, so the figure reads high by up to the second number shown (<code>-N</code>) and is never biased low. A genuine landing error shows as a value well outside that band, and keyframe snapping would show as values clustering near multiples of the keyframe interval.
+<br><br>
 <b>Seeks land late, not just wrong.</b> A seeking player's playhead <i>freezes</i> until the seek resolves while the live player keeps moving, so aiming the armed player at <code>live - loopDuration</code> using live's position at issue time lands it short by exactly the settle time. The re-arm therefore aims at where live <i>will</i> be on landing, using the last measured settle, and the arm lead stretches to <code>settle + 0.8 s</code> when that exceeds 1.5&nbsp;s. Without this a client with ~900&nbsp;ms seek settle never locks on at all: every pass exceeds the correction clamp, holds, and misses.
 <br><br>
 <b>Deliberate deviation from spec:</b> the retired player is parked at <code>loopStart-1.5</code> immediately after the swap <i>and</i> re-seeked ahead of the fade whenever the loop is longer than ~2&nbsp;s. Without that second seek the armed player just runs on past loopStart for the whole pass and there is nothing to fade into. Both seeks are logged; the re-arm is the one whose landing error matters.
@@ -132,7 +134,7 @@ var jumpReq=null;                 // pending window jump, survives a cur swap mi
 var JUMP_SETTLE=250;              // ms a jump-armed player must be settled before splicing
 var pollTimer=null;
 var passNo=0, passes=[], cur={};
-var startWall=0, qcount=0;
+var startWall=0, qcount=0, lastPollWall=0;
 
 function mkTrk(){ return {raw:-1,rawWall:0,state:-99,everPlaying:false,baseDur:0,adFlag:false,ready:false,seek:null,stall:0,staleMax:0,staleBase:0,qualitySet:false,readyWall:0,rate:1,lastSettle:0}; }
 var watch=null;   // post-switch audio-continuity monitor
@@ -283,6 +285,8 @@ function armSeek(k,target,tag){
 
 function poll(){
   var w=now();
+  var pollGap=lastPollWall?w-lastPollWall:POLL;   // real interval, for the seek-landing bound
+  lastPollWall=w;
   ['A','B'].forEach(function(k){
     var p=P[k];
     if(!p || !p.getCurrentTime) return;
@@ -300,10 +304,17 @@ function poll(){
 
     if(t!==T[k].raw){
       if(T[k].seek && Math.abs(t-T[k].seek.target)<2.5){
-        var est=t-(w-T[k].seek.wall)/1000*(T[k].rate||cfg.rate);
-        var err=(est-T[k].seek.target)*1000;
-        log('seek '+k+' ('+T[k].seek.tag+') landed ~'+est.toFixed(3)+'  err '+err.toFixed(1)+' ms  settle '+(w-T[k].seek.wall).toFixed(0)+' ms');
-        cur.seekErr=err; cur.seekSettle=w-T[k].seek.wall;
+        // The playhead is FROZEN while a seek resolves, so the landed position is simply
+        // the first value we observe -- do NOT back-project it by the settle interval.
+        // (Doing so made an exact seek report err = -settle, which is not a landing error
+        // at all.) The player may have been playing since it landed, somewhere in the last
+        // poll interval, so this reads high by 0..unc ms and is never biased low.
+        var r=(T[k].rate||cfg.rate);
+        var err=(t-T[k].seek.target)*1000;
+        var unc=pollGap*r;
+        log('seek '+k+' ('+T[k].seek.tag+') landed '+t.toFixed(3)+'  err '+err.toFixed(1)+
+            ' ms (+0/-'+unc.toFixed(0)+')  settle '+(w-T[k].seek.wall).toFixed(0)+' ms');
+        cur.seekErr=err; cur.seekUnc=unc; cur.seekSettle=w-T[k].seek.wall;
         T[k].lastSettle=w-T[k].seek.wall;
         T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
       }
@@ -317,7 +328,7 @@ function poll(){
 
     if(T[k].seek && (w-T[k].seek.wall)>3000){
       log('seek '+k+' ('+T[k].seek.tag+') never confirmed after 3 s; forcing ready','warn');
-      cur.seekErr=NaN; cur.seekSettle=w-T[k].seek.wall;
+      cur.seekErr=NaN; cur.seekUnc=NaN; cur.seekSettle=w-T[k].seek.wall;
       T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
     }
   });
@@ -781,7 +792,7 @@ function render(){
     h+='<tr><td>'+x.n+'</td><td class="l '+gcls+'">'+(x.gap===undefined?'--':x.gap+(x.gapBuf?' BUF':''))+
        '</td><td class="k">'+(x.gapBase===undefined?'--':x.gapBase)+
        '</td><td class="'+cls+'">'+fmt(x.armedErr)+'</td><td>'+fmt(x.liveErr)+'</td><td>'+fmt(x.offset)+
-       '</td><td>'+fmt(x.corr*1000)+'</td><td>'+fmt(x.seekErr)+'</td><td>'+fmt(x.seekSettle,0)+'</td><td>'+fmt(x.fadeMs)+
+       '</td><td>'+fmt(x.corr*1000)+'</td><td>'+fmt(x.seekErr)+(x.seekUnc?' <span class="k">-'+fmt(x.seekUnc,0)+'</span>':'')+'</td><td>'+fmt(x.seekSettle,0)+'</td><td>'+fmt(x.fadeMs)+
        '</td><td>'+(x.steps===undefined?'--':x.steps)+'</td><td class="'+scls+'">'+fmt(x.stepMax)+'</td></tr>';
   }
   h+='</table>';
