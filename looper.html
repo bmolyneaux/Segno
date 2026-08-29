@@ -266,6 +266,15 @@ function runLoop(){
   // fading anyway would splice to a wrong position
   if(L>=trigger && cur.rearmed && settledArmed && Math.abs(corr)<=MAXCORR){ cur.corrAtFade=corr; fade(); return; }
 
+  // ...but trim used to learn ONLY from a completed fade, and a large offset blocks the fade,
+  // so it could never correct its way out of exactly the case it exists for -- it sat at 0
+  // while playback overran by more than a second, every pass, forever. Learn from a blocked
+  // pass too, once, so successive passes walk the offset back into range.
+  if(L>=cfg.le && cur.rearmed && settledArmed && Math.abs(corr)>MAXCORR && !cur.learned){
+    cur.learned=true;
+    learnTrim(armed,corr);
+  }
+
   // Recovery must fire ONCE and then wait: re-seeking every poll resets the armed player's
   // settle clock, so it never becomes usable and playback runs away forever.
   if(L>=cfg.le+1.0 && !T[armed].seek && (!cur.recov || now()-cur.recov>1200)){
@@ -281,6 +290,15 @@ function runLoop(){
     one(live,function(p){ p.seekTo(cfg.ls+wrapIntoLoop(L),true); });
     reArm();
   }
+}
+
+// Feed the residual back into the seek target for the player we just seeked. Measured
+// on-device, seeks land accurately and settle is ~20 ms, so this is NOT correcting a landing
+// bias -- it absorbs whatever is left (decoder catch-up after a seek, settle misprediction)
+// without needing to model it. Gain 0.5 is deliberate: halving it doubles the number of
+// passes you hear the error for, and a slow convergence is audible.
+function learnTrim(k,corr){
+  T[k].trim=Math.max(-2,Math.min(2,T[k].trim+0.5*corr));
 }
 
 // ---------- crossfade ----------
@@ -302,15 +320,7 @@ function fade(){
 function done(from,to){
   one(from,function(p){ p.setVolume(0); });
   one(to,  function(p){ p.setVolume(100); });
-  // Feed the residual back into the seek target for the player we just seeked. Measured
-  // on-device, seeks land accurately and settle is ~20 ms, so this is NOT correcting a
-  // landing bias -- it absorbs whatever is left (decoder catch-up after a seek, settle
-  // misprediction) without needing to model it. Gain and clamp are deliberately modest:
-  // corr carries measurement noise, and this feeds straight into a real seek target.
-  if(cur.corrAtFade!==undefined){
-    var tr=T[to].trim+0.25*cur.corrAtFade;
-    T[to].trim=Math.max(-1,Math.min(1,tr));
-  }
+  if(cur.corrAtFade!==undefined) learnTrim(to,cur.corrAtFade);
   live=to; armed=from;
   T[armed].ready=false;
   cur={rearmed:false};
