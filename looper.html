@@ -32,6 +32,8 @@
   <button id="back">&laquo;</button>
   <button id="fwd">&raquo;</button>
   <select id="rate"><option>0.5</option><option>0.75</option><option selected>1</option></select>
+  <label>lead ms <input type="number" id="lead" value="0" step="25" style="width:60px"></label>
+  <span id="ver" style="color:#666">v1</span>
 </div>
 
 <div id="stage">
@@ -245,6 +247,13 @@ function runLoop(){
   }
 
   var corr=(L-A)-dur;
+  // Wall-clock latency compensation, dialed by ear. Device evidence: overshoot past
+  // loopEnd scales with playback rate, i.e. a fixed WALL duration separates our position
+  // estimate from the audible result (stale currentTime at delivery, iframe event-loop
+  // lag applying setVolume, detection lag -- indistinguishable from here). Triggering
+  // early by that wall duration cancels it; the value that nulls the overshoot on a
+  // device IS that device's total latency. Desktop default 0.
+  var leadS=((parseFloat($('lead').value)||0)/1000)*(T[live].rate||cfg.rate);
   // The fade must COMPLETE at loopEnd, not start there. Triggering at loopEnd runs the
   // outgoing XF wall-ms past the end at audible volume -- heard as overshooting the loop,
   // scaling with playback rate (confirmed on device: half as far at 0.5x). Triggering at
@@ -252,7 +261,7 @@ function runLoop(){
   // it enters at zero volume and only reaches full level exactly at loopStart -- the loud
   // part of the fade always sits on correct material. Analytically the incoming is at
   // loopStart-XF when the fade begins, at loopStart when it ends.
-  var trigger=cfg.le-xs+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
+  var trigger=cfg.le-xs-leadS+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
