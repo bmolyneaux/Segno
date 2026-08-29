@@ -49,7 +49,8 @@
 <div id="time"></div>
 
 <script>
-var XF=250, POLL=20, STEPS=10, MAXCORR=1.25, JUMP_SETTLE=250, ARM_MIN=1.5;
+var XF=80, POLL=20, STEPS=10, MAXCORR=1.25, JUMP_SETTLE=250, ARM_MIN=1.5;
+var MIN_STEP=20;   // ms; below this setTimeout jitter and postMessage latency swamp the ramp
 
 var $=function(s){ return document.getElementById(s); };
 var P={A:null,B:null}, live='A', armed='B';
@@ -244,12 +245,14 @@ function runLoop(){
   }
 
   var corr=(L-A)-dur;
-  // Tail overlap. Triggering at loopEnd-xfade would put the incoming player at
-  // loopStart-xfade when the fade BEGINS, so a whole crossfade of pre-loopStart material
-  // fades in -- audibly "seeking too early" once the fade is long. Trigger at loopEnd
-  // instead: the incoming starts exactly on loopStart and the outgoing runs past loopEnd
-  // while fading out, which is its natural continuation and is masked by the fade.
-  var trigger=cfg.le+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
+  // The fade must COMPLETE at loopEnd, not start there. Triggering at loopEnd runs the
+  // outgoing XF wall-ms past the end at audible volume -- heard as overshooting the loop,
+  // scaling with playback rate (confirmed on device: half as far at 0.5x). Triggering at
+  // loopEnd-XF instead puts the whole bleed BEFORE loopStart on the incoming side, where
+  // it enters at zero volume and only reaches full level exactly at loopStart -- the loud
+  // part of the fade always sits on correct material. Analytically the incoming is at
+  // loopStart-XF when the fade begins, at loopStart when it ends.
+  var trigger=cfg.le-xs+Math.max(-MAXCORR,Math.min(MAXCORR,corr));
 
   // a correction past the clamp means the armed player is in the wrong place entirely;
   // fading anyway would splice to a wrong position
@@ -275,16 +278,20 @@ function runLoop(){
 // ---------- crossfade ----------
 function fade(){
   phase='fading';
-  var from=live, to=armed, dt=XF/STEPS;
-  for(var i=1;i<=STEPS;i++){
+  // 10 steps only if each gets >= MIN_STEP ms: setTimeout is clamped and jittery, and
+  // every setVolume is a postMessage applied on the player's own event-loop turn.
+  var from=live, to=armed;
+  var steps=Math.max(2,Math.min(STEPS,Math.floor(XF/MIN_STEP)));
+  var dt=XF/steps;
+  for(var i=1;i<=steps;i++){
     (function(i){
       setTimeout(function(){
-        var f=i/STEPS;
+        var f=i/steps;
         try{
           P[from].setVolume(Math.round(100*Math.sqrt(1-f)));   // equal power
           P[to].setVolume(Math.round(100*Math.sqrt(f)));
         }catch(e){}
-        if(i===STEPS) done(from,to);
+        if(i===steps) done(from,to);
       },dt*i);
     })(i);
   }
