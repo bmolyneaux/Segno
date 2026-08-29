@@ -58,15 +58,16 @@ var cfg={id:'',ls:18.1,le:25.7,rate:1};
 var T={A:trk(),B:trk()};
 var poller=null, cur={}, jumpReq=null, vidDur=0, apiReady=false, loadT=null, paused=false, nudge=0;
 
-function trk(){ return {raw:-1,rawWall:0,st:-99,play:false,ready:false,readyWall:0,seek:null,settle:300,rate:1,stall:0,trim:0}; }
+function trk(){ return {raw:-1,rawWall:0,st:-99,play:false,ready:false,readyWall:0,seek:null,settle:300,rate:1,stall:0,trim:0,tick:0}; }
 function now(){ return performance.now(); }
 
 // interpolate between polls; cap so a stall cannot run away
 function proj(k){
   var t=T[k];
   if(t.raw<0) return 0;
+  var cap=Math.max(0.5,2.5*(t.tick||16)/1000);   // never freeze mid-report-interval
   var d=(now()-t.rawWall)/1000*(t.rate||cfg.rate);
-  return t.raw+(d>0.5?0.5:d);
+  return t.raw+(d>cap?cap:d);
 }
 
 function parseId(s){
@@ -146,6 +147,12 @@ function poll(){
     T[k].st=s;
     if(s===1) T[k].play=true;
     if(t!==T[k].raw){
+      // how often this player reports a NEW currentTime. Desktop is ~per frame; mobile can
+      // be hundreds of ms. Everything downstream must be judged against this, not a constant.
+      if(T[k].rawWall && !T[k].seek){
+        var gap=w-T[k].rawWall;
+        if(gap>0 && gap<2000) T[k].tick = T[k].tick ? T[k].tick*0.8+gap*0.2 : gap;
+      }
       if(T[k].seek && Math.abs(t-T[k].seek.target)<2.5){
         T[k].settle=w-T[k].seek.wall;      // measured, feeds the next seek's aim
         T[k].seek=null; T[k].ready=true; T[k].readyWall=w;
@@ -183,6 +190,12 @@ function reconcile(){
   }
 }
 
+// "Not advancing" only means something relative to how often this player reports at all.
+// A fixed 120 ms threshold marks a healthy mobile player as stalled for most of every
+// update cycle, so the splice can only fire in the brief window after each report and
+// lands late by up to one interval.
+function stallLimit(k){ return Math.max(120,2.5*(T[k].tick||16)); }
+
 function tryRun(){
   if(!(T.A.play && T.B.play)){
     // Autoplay may have been blocked, in which case the user starts playback by clicking
@@ -210,7 +223,7 @@ function tryRun(){
 
 function runLoop(){
   var L=proj(live), A=proj(armed), dur=cfg.le-cfg.ls, xs=XF/1000;
-  var settledArmed = T[armed].ready && T[armed].st===1 && T[armed].stall<=120 &&
+  var settledArmed = T[armed].ready && T[armed].st===1 && T[armed].stall<=stallLimit(armed) &&
                      T[armed].readyWall && now()-T[armed].readyWall>JUMP_SETTLE;
 
   // a jump owns the armed player until it fires
